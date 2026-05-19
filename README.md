@@ -1,13 +1,11 @@
+<p align="center">
+  <img src="docs/banner.png" alt="sim_logs — live structured-log overlay for the iOS Simulator">
+</p>
+
 # sim_logs
 
 > **Live structured-log overlay for the iOS Simulator.**
 > Charles + Console.app + analytics inspector, in a borderless SwiftUI panel that snaps beside your simulator window.
-
-<p align="center">
-  <img src="docs/screenshots/sim-console.png" alt="sim-console panel showing the Network tab" width="420">
-  &nbsp;
-  <img src="docs/screenshots/demo-app.png" alt="DemoApp running on the iOS Simulator" width="260">
-</p>
 
 Two independent pieces you can adopt one at a time:
 

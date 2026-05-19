@@ -51,6 +51,8 @@ SUBSYSTEM=""
 USE_DEFAULTS=1
 FOREGROUND=0
 EXTRA_TABS=()
+EXPORT_TO="${SIM_CONSOLE_EXPORT:-$HOME/.sim-console/events.jsonl}"
+NO_EXPORT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --no-default-tabs)   USE_DEFAULTS=0; shift ;;
     --tab)               EXTRA_TABS+=("$2"); shift 2 ;;
     --foreground)        FOREGROUND=1; shift ;;
+    --export-to)         EXPORT_TO="$2"; shift 2 ;;
+    --no-export)         NO_EXPORT=1; shift ;;
     -h|--help)           print_help; exit 0 ;;
     -*)                  echo "Unknown flag: $1" >&2; print_help; exit 2 ;;
     *)
@@ -183,6 +187,9 @@ if [[ -n "$ACCENT" ]]; then ARGS+=(--accent "$ACCENT"); fi
 for t in "${TABS[@]}"; do
   ARGS+=(--tab "$t")
 done
+if [[ "$NO_EXPORT" != "1" ]]; then
+  ARGS+=(--export-to "$EXPORT_TO")
+fi
 
 echo "▸ device : $DEVICE"
 echo "▸ app    : $DISPLAY_NAME ($BUNDLE_ID)"
@@ -192,6 +199,9 @@ for t in "${TABS[@]}"; do
   IFS='|' read -r KIND NAME _ <<< "$t"
   echo "    • $NAME [$KIND]"
 done
+if [[ "$NO_EXPORT" != "1" ]]; then
+  echo "▸ export : $EXPORT_TO  (override with --export-to / --no-export)"
+fi
 
 if [[ "$FOREGROUND" == "1" ]]; then
   exec "$BIN" "${ARGS[@]}"

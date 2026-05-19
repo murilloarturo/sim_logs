@@ -125,6 +125,30 @@ That symlinks `.claude/skill/SKILL.md` into `~/.claude/skills/sim-console/`. The
 
 The skill is **idempotent** — re-running `install` or `integrate` is safe; it only does work that hasn't been done yet. If you run multiple Claude Code sessions in parallel against different simulators, each `/sim-console` call picks up that session's locked sim automatically (when used alongside a sim-coordination tool).
 
+### Optional: MCP server for agent introspection
+
+The skill drives the **visual** panel. To let an agent *read* what the app is emitting — "what status did /profile return?", "did the share button fire the right event?", "show me errors in the last 60s" — install the companion MCP server:
+
+```bash
+brew install uv                              # one-time, if not installed
+~/Developer/sim_logs/Tools/install-mcp.sh    # registers with Claude Code
+```
+
+`sim-console` already writes a rolling NDJSON of every captured event to `~/.sim-console/events.jsonl` (overridable via `SIM_CONSOLE_EXPORT`). The MCP server reads that file and exposes six tools:
+
+| Tool | What it returns |
+|---|---|
+| `list_recent_requests(filter, status_min, status_max, method, limit)` | Newest-first network rows with method, status, duration, byte_size, headers, bodies (clipped to 200 chars in list view). |
+| `get_request(id)` | Full record for one request — all headers + full bodies. |
+| `list_recent_analytics(filter, kinds, since_seconds, limit)` | Recent analytics + screen events. |
+| `list_recent_logs(filter, levels, since_seconds, limit)` | Structured log entries from `SimConsole.log(...)`. |
+| `stats()` | Counts by kind, status-bucket breakdown, time span. |
+| `clear()` | Reset the export buffer between test scenarios. |
+
+Tools surface as `mcp__sim_logs__*` in fresh Claude Code sessions. The visual panel and the MCP server share the same in-memory event source — neither blocks the other.
+
+
+
 ---
 
 ## Try the demo app

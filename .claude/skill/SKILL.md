@@ -251,3 +251,24 @@ Report back which sim + bundle id were chosen so the user can sanity-check.
 - "Set up sim-console on this Mac" → `/sim-console install`
 
 If the user asks to "see the logs" in a debugger / Xcode sense, they probably want `/runluzia logs` instead (raw unified log stream). `/sim-console` is for **structured** event viewing.
+
+---
+
+## Companion: MCP server (for agentic queries)
+
+`sim-console` also writes every captured event to `~/.sim-console/events.jsonl` (overridable via `SIM_CONSOLE_EXPORT` or `--export-to`). A small MCP server in `Tools/mcp-server/` reads that file and exposes query tools to Claude:
+
+- `mcp__sim_logs__list_recent_requests(filter, status_min, status_max, method, limit)`
+- `mcp__sim_logs__get_request(id)`
+- `mcp__sim_logs__list_recent_analytics(filter, kinds, since_seconds, limit)`
+- `mcp__sim_logs__list_recent_logs(filter, levels, since_seconds, limit)`
+- `mcp__sim_logs__stats()`
+- `mcp__sim_logs__clear()`
+
+Install once on the user's machine with `~/Developer/sim_logs/Tools/install-mcp.sh` (requires `uv` and the `claude` CLI). The tools surface in any **new** Claude Code session — existing sessions need to reload to pick them up.
+
+When **should** you use the MCP tools instead of the visual panel?
+- The panel is for the **human** to glance at while they tap.
+- The MCP tools are for the **agent** to introspect: "what status did the /profile request return?", "did the share button fire the share_event?", "show me errors in the last 60s". Use the MCP path during automated debugging or test-loop scenarios where the agent needs to *read* what the app emitted, not just display it for the user.
+
+Both share the same in-memory event source — neither blocks the other.

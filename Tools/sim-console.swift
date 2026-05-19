@@ -51,6 +51,7 @@ struct Args {
     var side = "right"
     var level = "info"
     var tabs: [TabSpec] = []
+    var exportTo: String = ""
 }
 
 func parseColor(_ hex: String) -> Color? {
@@ -92,6 +93,7 @@ func parseArgs() -> Args {
         case "--tab":
             if let t = parseTabSpec(argv[i+1]) { a.tabs.append(t) }
             i += 2
+        case "--export-to": a.exportTo = argv[i+1]; i += 2
         default: i += 1
         }
     }
@@ -295,6 +297,49 @@ enum TabEntry: Identifiable {
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - Exporter (NDJSON sink for MCP / external consumers)
+
+/// Appends one JSON object per line to `path` for every entry that flows
+/// through any tab. Network entries get re-emitted every time their row
+/// state changes (request → response → headers → body), so a consumer can
+/// either replay all events or dedup by `(kind, id)` and take the latest.
+///
+/// The file is truncated on startup so each `sim-console` run produces a
+/// fresh log.
+final class Exporter {
+    let path: String
+    private let queue = DispatchQueue(label: "sim-console.exporter", qos: .utility)
+    private var handle: FileHandle?
+
+    init?(path: String) {
+        guard !path.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: path)
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: path, contents: nil)
+        guard let h = try? FileHandle(forWritingTo: url) else {
+            diag("exporter: failed to open \(path)")
+            return nil
+        }
+        self.path = path
+        self.handle = h
+        diag("exporter: writing to \(path)")
+    }
+
+    func write(_ payload: [String: Any]) {
+        queue.async { [weak self] in
+            guard let self,
+                  let handle = self.handle,
+                  JSONSerialization.isValidJSONObject(payload),
+                  let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys, .withoutEscapingSlashes])
+            else { return }
+            handle.write(data)
+            handle.write(Data([0x0a]))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Tab view model
 
 final class TabViewModel: ObservableObject, Identifiable {
@@ -308,6 +353,7 @@ final class TabViewModel: ObservableObject, Identifiable {
     private var carry: String = ""
     private var requestIndex: [String: Int] = [:]  // net id → position in entries
     private let maxEntries: Int = 1000
+    weak var exporter: Exporter?
 
     init(spec: TabSpec) {
         self.id = "\(spec.kind.rawValue)-\(spec.name)"
@@ -469,6 +515,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                 existing.responseHeaders = d.headers ?? [:]
                 existing.responseBody = d.body
                 entries[idx] = .network(existing)
+                exportNetworkUpdate(existing)
             } else {
                 // Response without matching request — synthesize a row anyway.
                 let entry = NetworkEntry(
@@ -487,6 +534,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                 existing.error = d.error
                 existing.durationMs = d.duration_ms
                 entries[idx] = .network(existing)
+                exportNetworkUpdate(existing)
             } else {
                 ingestText(rawLine)
             }
@@ -501,6 +549,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                 default: break
                 }
                 entries[idx] = .network(existing)
+                exportNetworkUpdate(existing)
             }
         case "net.header":
             // One log entry per header — pair to existing row by id + direction.
@@ -514,6 +563,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                 default: break
                 }
                 entries[idx] = .network(existing)
+                exportNetworkUpdate(existing)
             }
         default:
             ingestText(rawLine)
@@ -532,6 +582,75 @@ final class TabViewModel: ObservableObject, Identifiable {
             }
         }
         unread += 1
+        exportEntry(entry)
+    }
+
+    private func exportEntry(_ entry: TabEntry) {
+        guard let exporter else { return }
+        exporter.write(serialize(entry))
+    }
+
+    /// Called after mutating a network row in-place so the exporter sees the
+    /// new state. The exporter dedups by `id` on read.
+    private func exportNetworkUpdate(_ entry: NetworkEntry) {
+        guard let exporter else { return }
+        exporter.write(serialize(.network(entry)))
+    }
+
+    private func serialize(_ entry: TabEntry) -> [String: Any] {
+        switch entry {
+        case .network(let n):
+            var d: [String: Any] = [
+                "kind": "network",
+                "tab": spec.name,
+                "ts": n.createdAt.timeIntervalSince1970,
+                "id": n.id,
+                "method": n.method,
+                "url": n.url,
+                "request_headers": n.requestHeaders,
+                "response_headers": n.responseHeaders
+            ]
+            if let v = n.requestBody  { d["request_body"]  = v }
+            if let v = n.responseBody { d["response_body"] = v }
+            if let v = n.status       { d["status"]        = v }
+            if let v = n.durationMs   { d["duration_ms"]   = v }
+            if let v = n.byteSize     { d["byte_size"]     = v }
+            if let v = n.error        { d["error"]         = v }
+            return d
+        case .analytics(let a):
+            return [
+                "kind": a.kind,             // "analytics" | "screen"
+                "tab": spec.name,
+                "ts": a.timestamp.timeIntervalSince1970,
+                "event": a.event,
+                "screen": a.screen as Any,
+                "params": a.params.mapValues { $0.value }
+            ]
+        case .text(let t):
+            // Try to extract a structured JSON payload from the compact log
+            // line so SimConsole.log(...) calls in the Logs tab are queryable.
+            var d: [String: Any] = [
+                "kind": "text",
+                "tab": spec.name,
+                "ts": t.timestamp.timeIntervalSince1970,
+                "line": t.line,
+                "message_type": String(describing: t.messageType)
+            ]
+            if let payload = TabViewModel.extractJsonFromText(t.line) {
+                d["payload"] = payload
+            }
+            return d
+        }
+    }
+
+    private static func extractJsonFromText(_ line: String) -> [String: Any]? {
+        guard let r = line.range(of: "{") else { return nil }
+        let tail = String(line[r.lowerBound...]).replacingOccurrences(of: "\\134", with: "\\")
+        guard let data = tail.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data, options: []),
+              let dict = obj as? [String: Any]
+        else { return nil }
+        return dict
     }
 
     // MARK: parsing helpers
@@ -1131,12 +1250,15 @@ final class Controller {
     let panel: KeyablePanel
     let state: ConsoleState
     let args: Args
+    let exporter: Exporter?
     var lastFrame: NSRect = .zero
     var refreshTimer: Timer?
 
     init(args: Args) {
         self.args = args
+        self.exporter = Exporter(path: args.exportTo)
         let tabs = args.tabs.map { TabViewModel(spec: $0) }
+        for t in tabs { t.exporter = self.exporter }
         let appLabel = args.appLabel.isEmpty ? "sim-console" : args.appLabel
         let state = ConsoleState(tabs: tabs, appLabel: appLabel, accent: args.accent)
         self.state = state

@@ -181,6 +181,7 @@ APP_LABEL="$DISPLAY_NAME — $BUNDLE_ID"
 ARGS=(--device "$DEVICE"
       --tag "$CURRENT_NAME" --alt-tag "$ALT_NAME"
       --app-label "$APP_LABEL"
+      --bundle-id "$BUNDLE_ID"
       --width "$WIDTH" --gap "$GAP" --side "$SIDE"
       --level "$LEVEL")
 if [[ -n "$ACCENT" ]]; then ARGS+=(--accent "$ACCENT"); fi

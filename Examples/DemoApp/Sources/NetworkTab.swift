@@ -38,6 +38,18 @@ struct NetworkTab: View {
                     }
                 }
 
+                Section("Mocking target") {
+                    Button("GET /flaky — mock me!") {
+                        Task {
+                            SimConsole.analytics(event: "tap_network", params: ["scenario": "flaky"])
+                            // Mock this URL from the sim-console panel (or via the MCP)
+                            // to make the request return whatever you want without
+                            // touching the network.
+                            await client.fetch(URL(string: "https://httpbin.org/uuid")!)
+                        }
+                    }
+                }
+
                 Section("Edge cases") {
                     Button("GET /status/404 — error status") {
                         Task {

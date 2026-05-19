@@ -31,6 +31,7 @@ public final class SimConsoleURLProtocol: URLProtocol {
     private var startedAt: Date = .distantPast
     private var requestId: String = ""
     private var responseBuffer = Data()
+    private var pendingMockWork: DispatchWorkItem?
 
     public override class func canInit(with request: URLRequest) -> Bool {
         guard SimConsole.isEnabled else { return false }
@@ -55,6 +56,13 @@ public final class SimConsoleURLProtocol: URLProtocol {
         startedAt = Date()
         requestId = UUID().uuidString
 
+        // Short-circuit: if MockStore matches this request, synthesize a
+        // response and skip the network entirely.
+        if let mock = MockStore.shared.findMock(for: request as URLRequest) {
+            deliverMock(mock)
+            return
+        }
+
         SimConsole.network(
             request: requestId,
             method: request.httpMethod ?? "GET",
@@ -70,10 +78,71 @@ public final class SimConsoleURLProtocol: URLProtocol {
     }
 
     public override func stopLoading() {
+        pendingMockWork?.cancel()
+        pendingMockWork = nil
         dataTask?.cancel()
         session?.invalidateAndCancel()
         session = nil
         dataTask = nil
+    }
+
+    /// Synthesize an `HTTPURLResponse` from `mock` and deliver it via the
+    /// URLProtocol client. Always async-dispatched so we never reenter the
+    /// caller's `resume()` stack frame, and so `delay_ms` works.
+    private func deliverMock(_ mock: Mock) {
+        let url = request.url ?? URL(string: "about:blank")!
+        let body = (mock.response.status == 204) ? nil : mock.response.body
+        let bodyData = body?.data(using: .utf8) ?? Data()
+
+        var headers = mock.response.headers
+        // Set Content-Length explicitly — URLSession won't infer it for a
+        // synthesized response, and some clients depend on it.
+        if !headers.keys.contains(where: { $0.lowercased() == "content-length" }) {
+            headers["Content-Length"] = String(bodyData.count)
+        }
+        // Strip Transfer-Encoding — never chunked on a synthesized response.
+        for key in Array(headers.keys) where key.lowercased() == "transfer-encoding" {
+            headers.removeValue(forKey: key)
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: mock.response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
+
+        // Log the request side immediately so the row appears in the console.
+        SimConsole.network(
+            request: requestId,
+            method: request.httpMethod ?? "GET",
+            url: request.url?.absoluteString ?? "",
+            headers: request.allHTTPHeaderFields ?? [:],
+            body: bodyString(of: request),
+            mocked: true
+        )
+
+        let delay = Double(mock.delayMs) / 1000.0
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !bodyData.isEmpty {
+                self.client?.urlProtocol(self, didLoad: bodyData)
+            }
+            self.client?.urlProtocolDidFinishLoading(self)
+
+            SimConsole.network(
+                response: self.requestId,
+                status: mock.response.status,
+                durationMs: self.durationMs(),
+                headers: headers,
+                body: body,
+                byteSize: bodyData.count,
+                mocked: true
+            )
+        }
+        self.pendingMockWork = work
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func bodyString(of request: URLRequest) -> String? {

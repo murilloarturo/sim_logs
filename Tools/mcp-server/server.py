@@ -263,5 +263,207 @@ def clear() -> dict[str, Any]:
     return {"ok": False, "reason": f"export file not found at {path}"}
 
 
+# ----------------------------------------------------------------------------
+# Mock management — writes/reads the same file as the macOS UI + iOS reader
+# ----------------------------------------------------------------------------
+
+import uuid
+from datetime import datetime, timezone
+
+
+def _bundle_id() -> str | None:
+    """Resolve the target app's bundle id. Env var wins; otherwise, infer from
+    the most recent network entry's tab metadata; otherwise nil."""
+    env = os.environ.get("SIM_CONSOLE_BUNDLE_ID")
+    if env:
+        return env
+    events = _load_events()
+    for e in reversed(events):
+        if e.get("kind") == "network" and e.get("tab"):
+            # We don't have bundle id in the event; the caller must set the env var.
+            break
+    return None
+
+
+def _mocks_path(bundle_id: str | None = None) -> Path:
+    """Path to mocks-<bundle-id>.json. Falls back to scanning for the most
+    recently modified mocks-*.json in ~/.sim-console/."""
+    override = os.environ.get("MOCKS_PATH")
+    if override:
+        return Path(override)
+    bid = bundle_id or _bundle_id()
+    base = Path.home() / ".sim-console"
+    if bid:
+        return base / f"mocks-{bid}.json"
+    # Best-effort discovery for tooling without env var: pick most-recent mocks file.
+    if base.exists():
+        candidates = sorted(base.glob("mocks-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+    return base / "mocks-unknown.json"
+
+
+def _load_mocks(path: Path | None = None) -> dict[str, Any]:
+    p = path or _mocks_path()
+    if not p.exists():
+        return {"version": 1, "mocks": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"version": 1, "mocks": []}
+
+
+def _save_mocks(file: dict[str, Any], path: Path | None = None) -> Path:
+    """Atomic write: temp file + os.replace, so the iOS reader never sees half a file."""
+    p = path or _mocks_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(file, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, p)
+    return p
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@mcp.tool()
+def list_mocks() -> list[dict[str, Any]]:
+    """List all mocks currently configured for the active bundle id."""
+    return _load_mocks().get("mocks", [])
+
+
+def _normalize_body(body: Any) -> str | None:
+    """Accept body as either a plain string, a dict, or a list. Always store
+    as a string. FastMCP / Pydantic auto-parse JSON-looking strings into
+    structured types during validation, so accepting both shapes here lets
+    agents pass either form without surprise."""
+    if body is None: return None
+    if isinstance(body, str): return body
+    return json.dumps(body, separators=(",", ":"))
+
+
+@mcp.tool()
+def add_mock(
+    method: str,
+    url: str,
+    status: int,
+    headers: dict[str, str] | None = None,
+    body: str | dict[str, Any] | list[Any] | None = None,
+    delay_ms: int = 0,
+    enabled: bool = True,
+    body_contains: str | None = None,
+) -> dict[str, Any]:
+    """Add a new mock rule. Subsequent requests matching method + URL get the
+    synthesized response instead of hitting the network.
+
+    Args:
+        method: HTTP method (GET, POST, etc.). Case-insensitive at match time.
+        url: Full URL string. Exact match.
+        status: HTTP status code (100-599).
+        headers: Response headers. Defaults to {"Content-Type": "application/json"}.
+        body: Response body. Accepts a raw string OR a JSON-serializable
+              dict/list (auto-converted to a JSON string). None means no body.
+        delay_ms: Artificial delay before delivering the response (useful for testing loading states).
+        enabled: When false, the mock is persisted but not applied.
+        body_contains: Optional substring the request body must contain for the mock to apply.
+    """
+    file = _load_mocks()
+    mock = {
+        "id": str(uuid.uuid4()),
+        "match": {
+            "method": method.upper(),
+            "url": url,
+            "body_contains": body_contains,
+        },
+        "response": {
+            "status": status,
+            "headers": headers or {"Content-Type": "application/json"},
+            "body": _normalize_body(body),
+        },
+        "delay_ms": delay_ms,
+        "enabled": enabled,
+        "created_at": _now_iso(),
+    }
+    file["mocks"].append(mock)
+    p = _save_mocks(file)
+    return {"ok": True, "mock": mock, "file": str(p)}
+
+
+@mcp.tool()
+def update_mock(
+    id: str,
+    status: int | None = None,
+    headers: dict[str, str] | None = None,
+    body: str | dict[str, Any] | list[Any] | None = None,
+    delay_ms: int | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Partial-update an existing mock by id. Only non-None args overwrite."""
+    file = _load_mocks()
+    for mock in file["mocks"]:
+        if mock.get("id") == id:
+            if status is not None: mock["response"]["status"] = status
+            if headers is not None: mock["response"]["headers"] = headers
+            if body is not None: mock["response"]["body"] = _normalize_body(body)
+            if delay_ms is not None: mock["delay_ms"] = delay_ms
+            if enabled is not None: mock["enabled"] = enabled
+            _save_mocks(file)
+            return {"ok": True, "mock": mock}
+    return {"ok": False, "reason": f"no mock with id {id}"}
+
+
+@mcp.tool()
+def remove_mock(id: str) -> dict[str, Any]:
+    """Delete a mock by id."""
+    file = _load_mocks()
+    before = len(file["mocks"])
+    file["mocks"] = [m for m in file["mocks"] if m.get("id") != id]
+    if len(file["mocks"]) == before:
+        return {"ok": False, "reason": f"no mock with id {id}"}
+    _save_mocks(file)
+    return {"ok": True, "removed": id}
+
+
+@mcp.tool()
+def clear_mocks() -> dict[str, Any]:
+    """Remove all mocks for the active bundle id."""
+    file = _load_mocks()
+    n = len(file["mocks"])
+    file["mocks"] = []
+    p = _save_mocks(file)
+    return {"ok": True, "cleared": n, "file": str(p)}
+
+
+@mcp.tool()
+def mock_last_request(
+    status: int,
+    body: str | dict[str, Any] | list[Any] | None = None,
+    headers: dict[str, str] | None = None,
+    delay_ms: int = 0,
+) -> dict[str, Any]:
+    """Convenience: mock the most recent network request observed in the
+    export file. Saves you from having to look up the URL by hand —
+    "mock the last login call as a 401" is one MCP call.
+    """
+    rows = _latest_network_rows(_load_events())
+    if not rows:
+        return {"ok": False, "reason": "no network requests captured yet"}
+    rows.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    last = rows[0]
+    method = last.get("method", "GET")
+    url = last.get("url", "")
+    if not url:
+        return {"ok": False, "reason": "most recent request has no URL"}
+    return add_mock(
+        method=method,
+        url=url,
+        status=status,
+        headers=headers,
+        body=body,
+        delay_ms=delay_ms,
+    )
+
+
 if __name__ == "__main__":
     mcp.run()

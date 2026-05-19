@@ -52,6 +52,7 @@ struct Args {
     var level = "info"
     var tabs: [TabSpec] = []
     var exportTo: String = ""
+    var bundleId: String = ""
 }
 
 func parseColor(_ hex: String) -> Color? {
@@ -94,6 +95,7 @@ func parseArgs() -> Args {
             if let t = parseTabSpec(argv[i+1]) { a.tabs.append(t) }
             i += 2
         case "--export-to": a.exportTo = argv[i+1]; i += 2
+        case "--bundle-id": a.bundleId = argv[i+1]; i += 2
         default: i += 1
         }
     }
@@ -196,6 +198,7 @@ struct NetworkEntry: Identifiable {
     var responseBody: String?
     var byteSize: Int?
     var error: String?
+    var mocked: Bool = false
     let createdAt: Date
 
     var hostAndPath: String {
@@ -482,6 +485,7 @@ final class TabViewModel: ObservableObject, Identifiable {
             let direction: String?
             let name: String?
             let value: String?
+            let mocked: Bool?
         }
         guard let d = try? JSONDecoder().decode(Decoded.self, from: data),
               let id = d.id, let kind = d.kind else {
@@ -490,7 +494,7 @@ final class TabViewModel: ObservableObject, Identifiable {
         }
         switch kind {
         case "net.request":
-            let entry = NetworkEntry(
+            var entry = NetworkEntry(
                 id: id,
                 method: d.method ?? "?",
                 url: d.url ?? "",
@@ -504,6 +508,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                 error: nil,
                 createdAt: d.t.flatMap { Date(timeIntervalSince1970: $0) } ?? Date()
             )
+            if d.mocked == true { entry.mocked = true }
             append(.network(entry))
             requestIndex[id] = entries.count - 1
         case "net.response":
@@ -514,11 +519,12 @@ final class TabViewModel: ObservableObject, Identifiable {
                 existing.byteSize = d.byte_size
                 existing.responseHeaders = d.headers ?? [:]
                 existing.responseBody = d.body
+                if d.mocked == true { existing.mocked = true }
                 entries[idx] = .network(existing)
                 exportNetworkUpdate(existing)
             } else {
                 // Response without matching request — synthesize a row anyway.
-                let entry = NetworkEntry(
+                var entry = NetworkEntry(
                     id: id, method: "?", url: "(unknown — response without request)",
                     requestHeaders: [:], requestBody: nil,
                     status: d.status, durationMs: d.duration_ms,
@@ -526,6 +532,7 @@ final class TabViewModel: ObservableObject, Identifiable {
                     byteSize: d.byte_size, error: nil,
                     createdAt: d.t.flatMap { Date(timeIntervalSince1970: $0) } ?? Date()
                 )
+                if d.mocked == true { entry.mocked = true }
                 append(.network(entry))
             }
         case "net.error":
@@ -728,7 +735,7 @@ struct RootView: View {
     private var tabContent: some View {
         if let active = state.activeTab {
             switch active.spec.kind {
-            case .network:   NetworkList(model: active)
+            case .network:   NetworkList(model: active, mockStore: state.mockStore)
             case .analytics: AnalyticsList(model: active)
             case .text:      TextList(model: active)
             }
@@ -745,11 +752,13 @@ final class ConsoleState: ObservableObject {
     @Published var activeIndex: Int = 0
     let appLabel: String
     let accent: Color
+    let mockStore: MockStore?
 
-    init(tabs: [TabViewModel], appLabel: String, accent: Color) {
+    init(tabs: [TabViewModel], appLabel: String, accent: Color, mockStore: MockStore?) {
         self.tabs = tabs
         self.appLabel = appLabel
         self.accent = accent
+        self.mockStore = mockStore
     }
 
     var activeTab: TabViewModel? {
@@ -853,6 +862,7 @@ struct SearchBar: View {
 
 struct NetworkList: View {
     @ObservedObject var model: TabViewModel
+    var mockStore: MockStore?
     @State private var expanded: Set<String> = []
 
     var filtered: [NetworkEntry] {
@@ -874,7 +884,7 @@ struct NetworkList: View {
             ScrollView {
                 LazyVStack(spacing: 1) {
                     ForEach(filtered) { e in
-                        NetworkRow(entry: e, expanded: expanded.contains(e.id))
+                        NetworkRow(entry: e, expanded: expanded.contains(e.id), mockStore: mockStore)
                             .id(e.id)
                             .onTapGesture {
                                 if expanded.contains(e.id) { expanded.remove(e.id) }
@@ -894,6 +904,7 @@ struct NetworkList: View {
 struct NetworkRow: View {
     let entry: NetworkEntry
     let expanded: Bool
+    var mockStore: MockStore?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -905,6 +916,9 @@ struct NetworkRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
+                if entry.mocked {
+                    MockedBadge()
+                }
                 StatusBadge(status: entry.status, error: entry.error)
                 if let ms = entry.durationMs {
                     Text("\(ms)ms")
@@ -915,7 +929,7 @@ struct NetworkRow: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             if expanded {
-                NetworkDetail(entry: entry)
+                NetworkDetail(entry: entry, mockStore: mockStore)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
             }
@@ -947,6 +961,21 @@ struct MethodPill: View {
             .foregroundColor(color)
             .clipShape(RoundedRectangle(cornerRadius: 3))
             .frame(minWidth: 44)
+    }
+}
+
+/// Pill that marks a network row as "mocked" in the collapsed list view.
+/// Uses the same warm accent as the `MOCKED` pill in the expanded detail
+/// so the two states read as one consistent visual language.
+struct MockedBadge: View {
+    var body: some View {
+        Text("MOCK")
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(Color(red: 0.95, green: 0.70, blue: 0.30).opacity(0.20))
+            .foregroundColor(Color(red: 0.95, green: 0.70, blue: 0.30))
+            .clipShape(RoundedRectangle(cornerRadius: 3))
+            .help("Mocked response")
     }
 }
 
@@ -991,8 +1020,14 @@ struct StatusBadge: View {
 
 struct NetworkDetail: View {
     let entry: NetworkEntry
+    var mockStore: MockStore?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let store = mockStore {
+                MockControlsView(entry: entry, store: store)
+            }
+
             SectionLabel(text: "URL")
             Text(entry.url)
                 .font(Theme.mono)
@@ -1024,6 +1059,61 @@ struct NetworkDetail: View {
             }
         }
         .padding(.top, 6)
+    }
+}
+
+/// Mock controls — pulled out into its own view so the `@ObservedObject`
+/// requirement on `store` doesn't force every NetworkDetail to be tied to
+/// a MockStore (some sessions launch without `--bundle-id` and don't expose
+/// mocking at all).
+struct MockControlsView: View {
+    let entry: NetworkEntry
+    @ObservedObject var store: MockStore
+    @State private var sheetPresented: Bool = false
+
+    var existingMock: Mock? {
+        store.mock(matchingMethod: entry.method, url: entry.url)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let mock = existingMock {
+                Text("MOCKED")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(Color(red: 0.95, green: 0.70, blue: 0.30).opacity(0.20))
+                    .foregroundColor(Color(red: 0.95, green: 0.70, blue: 0.30))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                Button("Edit") { sheetPresented = true }
+                    .font(.system(size: 11))
+                Button("Remove") { store.remove(id: mock.id) }
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(red: 1.0, green: 0.45, blue: 0.45))
+            } else {
+                Button("Mock") { sheetPresented = true }
+                    .font(.system(size: 11))
+            }
+            Spacer()
+        }
+        .padding(.bottom, 4)
+        .sheet(isPresented: $sheetPresented) {
+            MockEditorView(
+                store: store,
+                presented: $sheetPresented,
+                method: entry.method,
+                url: entry.url,
+                prefill: existingMock ?? Mock(
+                    match: MockMatch(method: entry.method, url: entry.url),
+                    response: MockResponse(
+                        status: entry.status ?? 200,
+                        headers: entry.responseHeaders.isEmpty
+                            ? ["Content-Type": "application/json"]
+                            : entry.responseHeaders,
+                        body: entry.responseBody
+                    )
+                )
+            )
+        }
     }
 }
 
@@ -1236,6 +1326,328 @@ struct TextList: View {
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - Mocks (model + store + editor sheet + templates)
+
+/// Mirrors the schema written by/read by the iOS-side SimConsole SDK at
+/// `~/.sim-console/mocks-<bundle-id>.json`. Three writers — this macOS app,
+/// the Python MCP server, and manual file edits — converge on this file.
+/// The iOS app stat-polls it (no watcher) and reloads on mtime change.
+struct Mock: Codable, Identifiable, Equatable {
+    var id: String
+    var match: MockMatch
+    var response: MockResponse
+    var delayMs: Int
+    var enabled: Bool
+    var createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, match, response, enabled
+        case delayMs = "delay_ms"
+        case createdAt = "created_at"
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        match: MockMatch,
+        response: MockResponse,
+        delayMs: Int = 0,
+        enabled: Bool = true,
+        createdAt: String = ISO8601DateFormatter().string(from: Date())
+    ) {
+        self.id = id
+        self.match = match
+        self.response = response
+        self.delayMs = delayMs
+        self.enabled = enabled
+        self.createdAt = createdAt
+    }
+}
+
+struct MockMatch: Codable, Equatable {
+    var method: String
+    var url: String
+    var bodyContains: String?
+
+    enum CodingKeys: String, CodingKey {
+        case method, url
+        case bodyContains = "body_contains"
+    }
+}
+
+struct MockResponse: Codable, Equatable {
+    var status: Int
+    var headers: [String: String]
+    var body: String?
+}
+
+struct MockFile: Codable {
+    var version: Int
+    var mocks: [Mock]
+}
+
+final class MockStore: ObservableObject {
+    @Published private(set) var mocks: [Mock] = []
+    let bundleId: String
+    let path: String
+
+    init(bundleId: String) {
+        self.bundleId = bundleId
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".sim-console")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        self.path = (dir as NSString).appendingPathComponent("mocks-\(bundleId).json")
+        reload()
+    }
+
+    func reload() {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let file = try? JSONDecoder().decode(MockFile.self, from: data)
+        else {
+            self.mocks = []
+            return
+        }
+        self.mocks = file.mocks
+    }
+
+    func mock(forId id: String) -> Mock? { mocks.first { $0.id == id } }
+
+    func mock(matchingMethod method: String, url: String) -> Mock? {
+        mocks.first { $0.match.method.uppercased() == method.uppercased() && $0.match.url == url }
+    }
+
+    func upsert(_ mock: Mock) {
+        var current = mocks
+        if let idx = current.firstIndex(where: { $0.id == mock.id }) {
+            current[idx] = mock
+        } else {
+            current.append(mock)
+        }
+        write(current)
+    }
+
+    func remove(id: String) {
+        write(mocks.filter { $0.id != id })
+    }
+
+    private func write(_ newMocks: [Mock]) {
+        let file = MockFile(version: 1, mocks: newMocks)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? enc.encode(file) else { return }
+        // Atomic write: temp file + replace, so the iOS reader never sees half a file.
+        let tmp = path + ".tmp"
+        do {
+            try data.write(to: URL(fileURLWithPath: tmp), options: [.atomic])
+            try? FileManager.default.removeItem(atPath: path)
+            try FileManager.default.moveItem(atPath: tmp, toPath: path)
+            DispatchQueue.main.async { self.mocks = newMocks }
+        } catch {
+            diag("mock write failed: \(error)")
+        }
+    }
+}
+
+/// Suggested response bodies for common status codes — pre-fills the
+/// editor when the user picks a template. Inspired by Proxyman.
+enum MockTemplates {
+    static let codes: [(Int, String, String)] = [
+        (200, "OK",                  "{}"),
+        (201, "Created",             "{\"id\":\"new-id\",\"created\":true}"),
+        (204, "No Content",          ""),
+        (400, "Bad Request",         "{\"error\":\"bad_request\",\"code\":400,\"message\":\"Invalid request\"}"),
+        (401, "Unauthorized",        "{\"error\":\"unauthorized\",\"code\":401,\"message\":\"Authentication required\"}"),
+        (403, "Forbidden",           "{\"error\":\"forbidden\",\"code\":403,\"message\":\"Access denied\"}"),
+        (404, "Not Found",           "{\"error\":\"not_found\",\"code\":404,\"message\":\"Resource not found\"}"),
+        (409, "Conflict",            "{\"error\":\"conflict\",\"code\":409,\"message\":\"Resource conflict\"}"),
+        (422, "Unprocessable",       "{\"error\":\"validation_failed\",\"errors\":[{\"field\":\"name\",\"message\":\"is required\"}]}"),
+        (500, "Internal Server Err.","{\"error\":\"internal_server_error\",\"code\":500,\"message\":\"An unexpected error occurred\"}"),
+        (502, "Bad Gateway",         "{\"error\":\"bad_gateway\",\"code\":502}"),
+        (503, "Service Unavailable", "{\"error\":\"service_unavailable\",\"code\":503,\"message\":\"Try again later\"}"),
+        (504, "Gateway Timeout",     "{\"error\":\"gateway_timeout\",\"code\":504}"),
+    ]
+}
+
+/// Modal sheet for creating / editing one Mock. Pre-fills from the captured
+/// request + response when the user mocks an existing row; can also be opened
+/// blank from "+" (future).
+struct MockEditorView: View {
+    @ObservedObject var store: MockStore
+    @Binding var presented: Bool
+
+    let method: String
+    let url: String
+    let existingMockId: String?
+
+    @State private var status: String
+    @State private var headersText: String
+    @State private var bodyText: String
+    @State private var delayMs: String
+    @State private var enabled: Bool
+    @State private var validationWarning: String?
+
+    init(
+        store: MockStore,
+        presented: Binding<Bool>,
+        method: String,
+        url: String,
+        prefill: Mock?
+    ) {
+        self.store = store
+        self._presented = presented
+        self.method = method
+        self.url = url
+        self.existingMockId = prefill?.id
+
+        let r = prefill?.response
+        _status = State(initialValue: r.map { String($0.status) } ?? "200")
+        let hdrs = r?.headers ?? ["Content-Type": "application/json"]
+        let headersJson = (try? JSONSerialization.data(
+            withJSONObject: hdrs, options: [.prettyPrinted, .sortedKeys]
+        )).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        _headersText = State(initialValue: headersJson)
+        _bodyText = State(initialValue: r?.body ?? "{}")
+        _delayMs = State(initialValue: String(prefill?.delayMs ?? 0))
+        _enabled = State(initialValue: prefill?.enabled ?? true)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                MethodPill(method: method)
+                Text(url)
+                    .font(Theme.mono)
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(text: "Status")
+                    TextField("200", text: $status)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 70)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(text: "Suggest template")
+                    Menu {
+                        ForEach(MockTemplates.codes, id: \.0) { item in
+                            Button("\(item.0) — \(item.1)") {
+                                status = String(item.0)
+                                bodyText = item.2
+                            }
+                        }
+                    } label: {
+                        Text("Pick a template…")
+                            .font(.system(size: 11))
+                            .frame(maxWidth: 160, alignment: .leading)
+                    }
+                    .menuStyle(.borderlessButton)
+                }
+                Spacer()
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(text: "Delay (ms)")
+                    TextField("0", text: $delayMs)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 70)
+                }
+                Toggle("Enabled", isOn: $enabled)
+                    .toggleStyle(.checkbox)
+            }
+
+            SectionLabel(text: "Headers (JSON object)")
+            TextEditor(text: $headersText)
+                .font(Theme.mono)
+                .frame(minHeight: 70, maxHeight: 110)
+                .border(Theme.stroke)
+
+            HStack {
+                SectionLabel(text: "Body")
+                Spacer()
+                Button("Pretty-print JSON") {
+                    bodyText = prettyPrint(bodyText)
+                }
+                .font(.system(size: 10))
+            }
+            TextEditor(text: $bodyText)
+                .font(Theme.mono)
+                .frame(minHeight: 140)
+                .border(Theme.stroke)
+
+            if let warn = validationWarning {
+                Text(warn)
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(red: 0.95, green: 0.70, blue: 0.30))
+            }
+
+            HStack {
+                if existingMockId != nil {
+                    Button("Remove mock") {
+                        if let id = existingMockId { store.remove(id: id) }
+                        presented = false
+                    }
+                    .foregroundColor(Color(red: 1.0, green: 0.45, blue: 0.45))
+                }
+                Spacer()
+                Button("Cancel") { presented = false }
+                Button("Save") { save() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 520, height: 540)
+        .background(Theme.bg)
+    }
+
+    private func save() {
+        guard let s = Int(status), (100...599).contains(s) else {
+            validationWarning = "Status must be a number between 100 and 599."
+            return
+        }
+        guard let headersData = headersText.data(using: .utf8),
+              let headers = (try? JSONSerialization.jsonObject(with: headersData)) as? [String: String]
+        else {
+            validationWarning = "Headers must be a JSON object of string values."
+            return
+        }
+        // Body must parse as JSON when Content-Type indicates JSON. Blocks
+        // save on failure so we never persist a malformed mock that would
+        // later confuse the consuming app. To mock a non-JSON body (HTML,
+        // plain text), set a non-JSON Content-Type header.
+        let contentType = (headers.first { $0.key.lowercased() == "content-type" }?.value ?? "").lowercased()
+        if contentType.contains("json") && !bodyText.isEmpty {
+            guard let data = bodyText.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: data, options: [.allowFragments])) != nil
+            else {
+                validationWarning = "Body is not valid JSON. Fix it (or change Content-Type) to save."
+                return
+            }
+        }
+        validationWarning = nil
+        let delay = Int(delayMs) ?? 0
+        let mock = Mock(
+            id: existingMockId ?? UUID().uuidString,
+            match: MockMatch(method: method, url: url, bodyContains: nil),
+            response: MockResponse(status: s, headers: headers, body: bodyText.isEmpty ? nil : bodyText),
+            delayMs: delay,
+            enabled: enabled
+        )
+        store.upsert(mock)
+        presented = false
+    }
+
+    private func prettyPrint(_ raw: String) -> String {
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data, options: [.allowFragments]),
+              JSONSerialization.isValidJSONObject(obj),
+              let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+              let s = String(data: pretty, encoding: .utf8)
+        else { return raw }
+        return s
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Borderless keyable panel
 
 final class KeyablePanel: NSPanel {
@@ -1260,7 +1672,8 @@ final class Controller {
         let tabs = args.tabs.map { TabViewModel(spec: $0) }
         for t in tabs { t.exporter = self.exporter }
         let appLabel = args.appLabel.isEmpty ? "sim-console" : args.appLabel
-        let state = ConsoleState(tabs: tabs, appLabel: appLabel, accent: args.accent)
+        let mockStore: MockStore? = args.bundleId.isEmpty ? nil : MockStore(bundleId: args.bundleId)
+        let state = ConsoleState(tabs: tabs, appLabel: appLabel, accent: args.accent, mockStore: mockStore)
         self.state = state
 
         let panel = KeyablePanel(

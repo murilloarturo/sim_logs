@@ -50,6 +50,10 @@ public enum SimConsole {
             networkLogger   = Logger(subsystem: config.subsystem, category: "network")
             eventLogger     = Logger(subsystem: config.subsystem, category: "event")
         }
+        // MockStore reads ~/.sim-console/mocks-<bundle>.json. Inert outside
+        // the simulator. Wiring it up here means SimConsoleURLProtocol can
+        // consult it on every outbound request without further setup.
+        MockStore.shared.configure(bundleId: config.subsystem)
     }
 
     public static var isEnabled: Bool {
@@ -87,21 +91,22 @@ public enum SimConsole {
 
     // MARK: Network
 
-    public static func network(request id: String, method: String, url: String, headers: [String: String] = [:], body: String? = nil) {
+    public static func network(request id: String, method: String, url: String, headers: [String: String] = [:], body: String? = nil, mocked: Bool = false) {
         guard let logger = networkLogger else { return }
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "kind": "net.request",
             "t": now(),
             "id": id,
             "method": method,
             "url": url
         ]
+        if mocked { payload["mocked"] = true }
         logger.log("\(json(payload), privacy: .public)")
         emitHeaders(id: id, direction: "request", headers: headers)
         emitBody(id: id, direction: "request", body: body)
     }
 
-    public static func network(response id: String, status: Int, durationMs: Int, headers: [String: String] = [:], body: String? = nil, byteSize: Int? = nil) {
+    public static func network(response id: String, status: Int, durationMs: Int, headers: [String: String] = [:], body: String? = nil, byteSize: Int? = nil, mocked: Bool = false) {
         guard let logger = networkLogger else { return }
         var payload: [String: Any] = [
             "kind": "net.response",
@@ -111,6 +116,7 @@ public enum SimConsole {
             "duration_ms": durationMs
         ]
         if let byteSize { payload["byte_size"] = byteSize }
+        if mocked { payload["mocked"] = true }
         logger.log("\(json(payload), privacy: .public)")
         emitHeaders(id: id, direction: "response", headers: headers)
         emitBody(id: id, direction: "response", body: body)

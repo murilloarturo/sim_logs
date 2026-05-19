@@ -105,6 +105,28 @@ Rebuild, launch on a simulator, and run `./Tools/sim-console.sh <your-bundle-id>
 
 ---
 
+## Use it with an agent (Claude Code skill)
+
+If you use [Claude Code](https://claude.com/claude-code), `sim_logs` ships with a skill so any agent can install, integrate, and launch it for you:
+
+```bash
+git clone https://github.com/murilloarturo/sim_logs.git ~/Developer/sim_logs
+~/Developer/sim_logs/Tools/install-skill.sh
+```
+
+That symlinks `.claude/skill/SKILL.md` into `~/.claude/skills/sim-console/`. Then in any Claude Code session:
+
+| Command | What it does |
+|---|---|
+| `/sim-console install` | Clone (if missing) + build the macOS binary. |
+| `/sim-console integrate` | Wire `SimConsole` into the iOS project the agent is currently in — adds the Swift Package dependency, drops the `bootstrap` call into the `@main` entry point, registers `SimConsoleURLProtocol` on the URLSession factory, all behind `#if DEBUG`. |
+| `/sim-console` (or `/sim-console launch`) | Spawn the panel beside the booted sim, auto-detecting the project's bundle id. |
+| `/sim-console <bundle-id>` | Launch against an explicit bundle id. |
+
+The skill is **idempotent** — re-running `install` or `integrate` is safe; it only does work that hasn't been done yet. If you run multiple Claude Code sessions in parallel against different simulators, each `/sim-console` call picks up that session's locked sim automatically (when used alongside a sim-coordination tool).
+
+---
+
 ## Try the demo app
 
 `Examples/DemoApp/` is a self-contained iOS app that exercises every SDK surface:

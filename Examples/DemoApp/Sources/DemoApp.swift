@@ -9,6 +9,10 @@ struct DemoApp: App {
         SimConsole.bootstrap(.init(
             subsystem: Bundle.main.bundleIdentifier ?? "com.simconsole.demoapp"
         ))
+        // Anchor the start of cold-launch measurement at the earliest sane
+        // point. First call wins, so this is safe even if init runs more
+        // than once for any reason.
+        SimConsole.metric.appStartLaunch()
         SimConsole.log("DemoApp launched", level: .info, fields: [
             "build": "debug",
             "version": "1.0.0"

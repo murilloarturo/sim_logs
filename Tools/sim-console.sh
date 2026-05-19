@@ -150,6 +150,7 @@ fi
 # --- Build default tab set ---------------------------------------------------
 TABS=()
 if [[ "$USE_DEFAULTS" == "1" ]]; then
+  TABS+=("metric|Metrics|subsystem == \"$SUBSYSTEM\" AND category == \"metric\"")
   TABS+=("network|Network|subsystem == \"$SUBSYSTEM\" AND category == \"network\"")
   TABS+=("analytics|Analytics|subsystem == \"$SUBSYSTEM\" AND category == \"analytics\"")
   TABS+=("text|Logs|subsystem == \"$SUBSYSTEM\" AND category == \"event\"")

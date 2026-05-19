@@ -465,5 +465,111 @@ def mock_last_request(
     )
 
 
+# ----------------------------------------------------------------------------
+# Performance metrics — reads metric.* events from the export file
+# ----------------------------------------------------------------------------
+
+
+def _metric_events(kinds: set[str]) -> list[dict[str, Any]]:
+    return [e for e in _load_events() if e.get("kind") in kinds]
+
+
+@mcp.tool()
+def current_metrics() -> dict[str, Any]:
+    """Snapshot: latest value of each system sample, latest gauges, current
+    counter totals, and latest hang count. The fastest "is the app healthy"
+    check — use this first when triaging perf issues."""
+    samples = _metric_events({"metric.sample"})
+    latest_samples: dict[str, dict[str, Any]] = {}
+    for s in samples:
+        name = s.get("name")
+        if not name: continue
+        prev = latest_samples.get(name)
+        if not prev or s.get("ts", 0) > prev.get("ts", 0):
+            latest_samples[name] = s
+
+    gauges = _metric_events({"metric.gauge"})
+    latest_gauges: dict[str, dict[str, Any]] = {}
+    for g in gauges:
+        n = g.get("name")
+        if not n: continue
+        prev = latest_gauges.get(n)
+        if not prev or g.get("ts", 0) > prev.get("ts", 0):
+            latest_gauges[n] = g
+
+    counters = _metric_events({"metric.counter"})
+    latest_counters: dict[str, dict[str, Any]] = {}
+    for c in counters:
+        n = c.get("name")
+        if not n: continue
+        prev = latest_counters.get(n)
+        if not prev or c.get("ts", 0) > prev.get("ts", 0):
+            latest_counters[n] = c
+
+    hangs = _metric_events({"metric.hang"})
+    longest = max((h.get("duration_ms", 0) for h in hangs), default=0)
+
+    return {
+        "samples": {n: {"value": s.get("value"),
+                        "ts": s.get("ts"),
+                        "fields": s.get("fields", {})}
+                    for n, s in latest_samples.items()},
+        "gauges": {n: g.get("value") for n, g in latest_gauges.items()},
+        "counters": {n: c.get("total") for n, c in latest_counters.items()},
+        "hangs": {"count": len(hangs), "longest_ms": longest},
+    }
+
+
+@mcp.tool()
+def launch_timeline() -> list[dict[str, Any]]:
+    """Ordered list of launch milestones (e.g. scene_active, first_screen_visible)
+    with `ms_since_launch` deltas. Use to diagnose slow cold starts — where's
+    the gap between two milestones?"""
+    milestones = _metric_events({"metric.milestone"})
+    milestones.sort(key=lambda m: m.get("ms_since_launch", 0))
+    return [{"name": m.get("name"),
+             "ms_since_launch": m.get("ms_since_launch"),
+             "ts": m.get("ts"),
+             "fields": m.get("fields", {})}
+            for m in milestones]
+
+
+@mcp.tool()
+def recent_signposts(
+    name: str = "",
+    since_seconds: int = 60,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Custom timed regions emitted via SimConsole.metric.signpost(...) or
+    .measure(_:body:). Filter by exact name (empty = all)."""
+    cutoff = time.time() - since_seconds
+    sps = [e for e in _metric_events({"metric.signpost"})
+           if e.get("ts", 0) >= cutoff
+           and (not name or e.get("name") == name)]
+    sps.sort(key=lambda s: s.get("ts", 0), reverse=True)
+    return sps[:limit]
+
+
+@mcp.tool()
+def recent_hangs(since_seconds: int = 300, limit: int = 20) -> list[dict[str, Any]]:
+    """Main-thread hangs (>250ms blocks) in the last N seconds, newest first."""
+    cutoff = time.time() - since_seconds
+    hs = [e for e in _metric_events({"metric.hang"}) if e.get("ts", 0) >= cutoff]
+    hs.sort(key=lambda h: h.get("ts", 0), reverse=True)
+    return hs[:limit]
+
+
+@mcp.tool()
+def metric_history(name: str, seconds: int = 60) -> list[dict[str, Any]]:
+    """Time series for one sample/gauge by name (e.g. 'memory.resident_mb',
+    'fps.avg_1s'). Returns [(ts, value)] sorted oldest-first — good for
+    plotting or spotting trends like steady memory growth."""
+    cutoff = time.time() - seconds
+    events = [e for e in _metric_events({"metric.sample", "metric.gauge"})
+              if e.get("name") == name and e.get("ts", 0) >= cutoff]
+    events.sort(key=lambda e: e.get("ts", 0))
+    return [{"ts": e.get("ts"), "value": e.get("value")} for e in events]
+
+
 if __name__ == "__main__":
     mcp.run()

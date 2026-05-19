@@ -54,6 +54,12 @@ public enum SimConsole {
         // the simulator. Wiring it up here means SimConsoleURLProtocol can
         // consult it on every outbound request without further setup.
         MockStore.shared.configure(bundleId: config.subsystem)
+
+        // Start system metric sampling + main-thread hang detection.
+        // Both are no-ops on macOS host (the SwiftPM build target for tests).
+        _ = Metric.processStart  // anchor the launch reference NOW
+        MetricSampler.shared.start()
+        HangDetector.shared.start()
     }
 
     public static var isEnabled: Bool {

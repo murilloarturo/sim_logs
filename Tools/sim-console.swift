@@ -34,7 +34,7 @@ import Combine
 // MARK: - CLI args
 
 struct TabSpec {
-    enum Kind: String { case network, analytics, text }
+    enum Kind: String { case network, analytics, text, metric }
     let kind: Kind
     let name: String
     let predicate: String
@@ -285,16 +285,99 @@ struct AnyCodable: Codable, Hashable {
     }
 }
 
+// MARK: - Metrics (samples, milestones, signposts, gauges, counters, hangs)
+
+struct MetricSample: Identifiable {
+    let id: UUID = UUID()
+    let name: String              // "memory.resident_mb", "fps.avg_1s", etc.
+    let value: Double
+    let timestamp: Date
+    let fields: [String: AnyCodable]
+}
+
+struct MetricMilestone: Identifiable {
+    let id: UUID = UUID()
+    let name: String
+    let msSinceLaunch: Int
+    let timestamp: Date
+    let fields: [String: AnyCodable]
+}
+
+struct MetricSignpost: Identifiable {
+    let id: UUID = UUID()
+    let name: String
+    let durationMs: Int
+    let timestamp: Date
+    let fields: [String: AnyCodable]
+}
+
+struct MetricGauge: Identifiable {
+    let id: UUID = UUID()
+    let name: String
+    let value: Double
+    let timestamp: Date
+    let fields: [String: AnyCodable]
+}
+
+struct MetricCounter: Identifiable {
+    let id: UUID = UUID()
+    let name: String
+    let delta: Double
+    let total: Double
+    let timestamp: Date
+    let fields: [String: AnyCodable]
+}
+
+struct MetricHang: Identifiable {
+    let id: UUID = UUID()
+    let durationMs: Int
+    let timestamp: Date
+}
+
+/// Canonical app-launch event — emitted exactly once per process by the iOS
+/// SDK when `SimConsole.metric.appFinishLaunching()` is called. The panel
+/// reads only the FIRST such event so the "LAUNCH" header doesn't update
+/// when the user revisits a view.
+struct MetricLaunch: Identifiable {
+    let id: UUID = UUID()
+    let ms: Int
+    let timestamp: Date
+}
+
+enum MetricEntry: Identifiable {
+    case sample(MetricSample)
+    case milestone(MetricMilestone)
+    case signpost(MetricSignpost)
+    case gauge(MetricGauge)
+    case counter(MetricCounter)
+    case hang(MetricHang)
+    case launch(MetricLaunch)
+
+    var id: String {
+        switch self {
+        case .sample(let e): return "sm-\(e.id.uuidString)"
+        case .milestone(let e): return "ml-\(e.id.uuidString)"
+        case .signpost(let e): return "sp-\(e.id.uuidString)"
+        case .gauge(let e): return "gg-\(e.id.uuidString)"
+        case .counter(let e): return "ct-\(e.id.uuidString)"
+        case .hang(let e): return "hg-\(e.id.uuidString)"
+        case .launch(let e): return "lc-\(e.id.uuidString)"
+        }
+    }
+}
+
 enum TabEntry: Identifiable {
     case network(NetworkEntry)
     case analytics(AnalyticsEntry)
     case text(TextEntry)
+    case metric(MetricEntry)
 
     var id: String {
         switch self {
         case .network(let e): return "net-\(e.id)"
         case .analytics(let e): return "ana-\(e.id.uuidString)"
         case .text(let e): return "txt-\(e.id.uuidString)"
+        case .metric(let e): return "met-\(e.id)"
         }
     }
 }
@@ -416,6 +499,57 @@ final class TabViewModel: ObservableObject, Identifiable {
         case .network:   ingestNetwork(rawLine)
         case .analytics: ingestAnalytics(rawLine)
         case .text:      ingestText(rawLine)
+        case .metric:    ingestMetric(rawLine)
+        }
+    }
+
+    private func ingestMetric(_ rawLine: String) {
+        guard let payload = Self.extractJson(rawLine),
+              let data = payload.data(using: .utf8) else {
+            ingestText(rawLine); return
+        }
+        struct Decoded: Decodable {
+            let kind: String?
+            let name: String?
+            let value: Double?
+            let duration_ms: Int?
+            let ms_since_launch: Int?
+            let ms: Int?
+            let delta: Double?
+            let total: Double?
+            let t: Double?
+            let fields: [String: AnyCodable]?
+        }
+        guard let d = try? JSONDecoder().decode(Decoded.self, from: data),
+              let kind = d.kind else {
+            ingestText(rawLine); return
+        }
+        let ts = d.t.flatMap { Date(timeIntervalSince1970: $0) } ?? Date()
+        let fields = d.fields ?? [:]
+        switch kind {
+        case "metric.sample":
+            guard let name = d.name, let value = d.value else { return }
+            append(.metric(.sample(MetricSample(name: name, value: value, timestamp: ts, fields: fields))))
+        case "metric.milestone":
+            guard let name = d.name, let ms = d.ms_since_launch else { return }
+            append(.metric(.milestone(MetricMilestone(name: name, msSinceLaunch: ms, timestamp: ts, fields: fields))))
+        case "metric.signpost":
+            guard let name = d.name, let ms = d.duration_ms else { return }
+            append(.metric(.signpost(MetricSignpost(name: name, durationMs: ms, timestamp: ts, fields: fields))))
+        case "metric.gauge":
+            guard let name = d.name, let value = d.value else { return }
+            append(.metric(.gauge(MetricGauge(name: name, value: value, timestamp: ts, fields: fields))))
+        case "metric.counter":
+            guard let name = d.name, let delta = d.delta, let total = d.total else { return }
+            append(.metric(.counter(MetricCounter(name: name, delta: delta, total: total, timestamp: ts, fields: fields))))
+        case "metric.hang":
+            guard let ms = d.duration_ms else { return }
+            append(.metric(.hang(MetricHang(durationMs: ms, timestamp: ts))))
+        case "metric.launch":
+            guard let ms = d.ms else { return }
+            append(.metric(.launch(MetricLaunch(ms: ms, timestamp: ts))))
+        default:
+            ingestText(rawLine)
         }
     }
 
@@ -647,6 +781,52 @@ final class TabViewModel: ObservableObject, Identifiable {
                 d["payload"] = payload
             }
             return d
+        case .metric(let m):
+            var d: [String: Any] = [
+                "tab": spec.name,
+            ]
+            switch m {
+            case .sample(let s):
+                d["kind"] = "metric.sample"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["name"] = s.name
+                d["value"] = s.value
+                d["fields"] = s.fields.mapValues { $0.value }
+            case .milestone(let s):
+                d["kind"] = "metric.milestone"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["name"] = s.name
+                d["ms_since_launch"] = s.msSinceLaunch
+                d["fields"] = s.fields.mapValues { $0.value }
+            case .signpost(let s):
+                d["kind"] = "metric.signpost"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["name"] = s.name
+                d["duration_ms"] = s.durationMs
+                d["fields"] = s.fields.mapValues { $0.value }
+            case .gauge(let s):
+                d["kind"] = "metric.gauge"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["name"] = s.name
+                d["value"] = s.value
+                d["fields"] = s.fields.mapValues { $0.value }
+            case .counter(let s):
+                d["kind"] = "metric.counter"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["name"] = s.name
+                d["delta"] = s.delta
+                d["total"] = s.total
+                d["fields"] = s.fields.mapValues { $0.value }
+            case .hang(let s):
+                d["kind"] = "metric.hang"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["duration_ms"] = s.durationMs
+            case .launch(let s):
+                d["kind"] = "metric.launch"
+                d["ts"] = s.timestamp.timeIntervalSince1970
+                d["ms"] = s.ms
+            }
+            return d
         }
     }
 
@@ -738,6 +918,7 @@ struct RootView: View {
             case .network:   NetworkList(model: active, mockStore: state.mockStore)
             case .analytics: AnalyticsList(model: active)
             case .text:      TextList(model: active)
+            case .metric:    MetricsList(model: active)
             }
         } else {
             Text("No tabs configured")
@@ -795,7 +976,12 @@ struct SegmentBar: View {
                 SegmentChip(
                     label: tab.spec.name,
                     badge: tab === state.activeTab ? 0 : tab.unread,
-                    active: idx == state.activeIndex
+                    active: idx == state.activeIndex,
+                    // Metric tabs are *always* live recording from the moment
+                    // the panel attaches — surface that with a pulsing red dot
+                    // instead of an ever-growing event counter that the user
+                    // can't act on.
+                    isLiveStream: tab.spec.kind == .metric
                 )
                 .onTapGesture { state.select(idx) }
             }
@@ -810,12 +996,29 @@ struct SegmentChip: View {
     let label: String
     let badge: Int
     let active: Bool
+    let isLiveStream: Bool
+    @State private var pulsing: Bool = false
+
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 11, weight: active ? .semibold : .regular))
                 .foregroundColor(active ? Theme.textPrimary : Theme.textSecondary)
-            if badge > 0 {
+            if isLiveStream {
+                // Always show the pulsing recording dot for live-stream tabs
+                // (selected or not) — it's the "this is always recording"
+                // signal, not an unread-count indicator.
+                Circle()
+                    .fill(Color(red: 1.0, green: 0.30, blue: 0.30))
+                    .frame(width: 6, height: 6)
+                    .opacity(pulsing ? 1.0 : 0.30)
+                    .animation(
+                        .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                        value: pulsing
+                    )
+                    .onAppear { pulsing = true }
+                    .help("Live recording")
+            } else if badge > 0 {
                 Text(badge > 99 ? "99+" : String(badge))
                     .font(.system(size: 9, weight: .semibold))
                     .padding(.horizontal, 4)
@@ -965,11 +1168,12 @@ struct MethodPill: View {
 }
 
 /// Pill that marks a network row as "mocked" in the collapsed list view.
-/// Uses the same warm accent as the `MOCKED` pill in the expanded detail
-/// so the two states read as one consistent visual language.
+/// Single-letter "M" keeps the row tight — the full "MOCKED" label lives in
+/// the expanded detail. Same warm accent in both places so they read as one
+/// consistent visual language.
 struct MockedBadge: View {
     var body: some View {
-        Text("MOCK")
+        Text("M")
             .font(.system(size: 9, weight: .bold, design: .monospaced))
             .padding(.horizontal, 5).padding(.vertical, 2)
             .background(Color(red: 0.95, green: 0.70, blue: 0.30).opacity(0.20))
@@ -1321,6 +1525,356 @@ struct TextList: View {
         case .info: return Theme.textPrimary
         case .debug: return Theme.textDim
         case .default: return Theme.textPrimary
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Perf tab (system samples + milestones + signposts + gauges)
+
+/// Live performance dashboard. System samples drive sparklines + latest-value
+/// rows; launch milestones render as a vertical timeline; signposts +
+/// gauges + counters get tabular lists below.
+struct MetricsList: View {
+    @ObservedObject var model: TabViewModel
+
+    private var systemSamples: [String: [MetricSample]] {
+        var by: [String: [MetricSample]] = [:]
+        for e in model.entries {
+            if case .metric(.sample(let s)) = e {
+                by[s.name, default: []].append(s)
+            }
+        }
+        // Keep last 60 per series (1 Hz → 60s window).
+        return by.mapValues { Array($0.suffix(60)) }
+    }
+
+    private var milestones: [MetricMilestone] {
+        model.entries.compactMap {
+            if case .metric(.milestone(let m)) = $0 { return m } else { return nil }
+        }
+    }
+
+    /// First captured `metric.launch` event. The SDK guarantees exactly one
+    /// per process; the panel only displays this one and never updates it,
+    /// so revisiting a screen doesn't move the launch-time number.
+    private var firstLaunch: MetricLaunch? {
+        for e in model.entries {
+            if case .metric(.launch(let l)) = e { return l }
+        }
+        return nil
+    }
+
+    private var signposts: [MetricSignpost] {
+        model.entries.compactMap {
+            if case .metric(.signpost(let s)) = $0 { return s } else { return nil }
+        }
+    }
+
+    private var gauges: [String: MetricGauge] {
+        var latest: [String: MetricGauge] = [:]
+        for e in model.entries {
+            if case .metric(.gauge(let g)) = e { latest[g.name] = g }
+        }
+        return latest
+    }
+
+    private var counters: [String: MetricCounter] {
+        var latest: [String: MetricCounter] = [:]
+        for e in model.entries {
+            if case .metric(.counter(let c)) = e { latest[c.name] = c }
+        }
+        return latest
+    }
+
+    private var hangs: [MetricHang] {
+        model.entries.compactMap {
+            if case .metric(.hang(let h)) = $0 { return h } else { return nil }
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                LaunchSummaryView(launch: firstLaunch, milestoneCount: milestones.count)
+
+                Divider().background(Theme.stroke).padding(.vertical, 4)
+                SectionLabel(text: "System")
+                ForEach(["memory.resident_mb", "memory.peak_mb",
+                         "cpu.process_pct",
+                         "fps.avg_1s", "fps.hitches_1s",
+                         "thermal",
+                         "battery.level", "battery.charging"], id: \.self) { name in
+                    if let series = systemSamples[name] {
+                        MetricSampleRow(name: name, series: series)
+                    }
+                }
+
+                if !hangs.isEmpty {
+                    Divider().background(Theme.stroke).padding(.vertical, 4)
+                    SectionLabel(text: "Hangs (\(hangs.count))")
+                    ForEach(hangs.suffix(10)) { h in
+                        HangRow(hang: h)
+                    }
+                }
+
+                if !milestones.isEmpty {
+                    Divider().background(Theme.stroke).padding(.vertical, 4)
+                    SectionLabel(text: "Launch timeline")
+                    LaunchTimelineView(milestones: milestones)
+                }
+
+                if !signposts.isEmpty {
+                    Divider().background(Theme.stroke).padding(.vertical, 4)
+                    SectionLabel(text: "Signposts (\(signposts.count))")
+                    ForEach(signposts.suffix(40)) { s in
+                        SignpostRow(signpost: s)
+                    }
+                }
+
+                if !gauges.isEmpty {
+                    Divider().background(Theme.stroke).padding(.vertical, 4)
+                    SectionLabel(text: "Gauges")
+                    ForEach(gauges.keys.sorted(), id: \.self) { k in
+                        if let g = gauges[k] { KVRow(key: g.name, value: formatGauge(g.value)) }
+                    }
+                }
+
+                if !counters.isEmpty {
+                    Divider().background(Theme.stroke).padding(.vertical, 4)
+                    SectionLabel(text: "Counters")
+                    ForEach(counters.keys.sorted(), id: \.self) { k in
+                        if let c = counters[k] {
+                            KVRow(key: c.name, value: formatGauge(c.total) + "  (Δ \(formatGauge(c.delta)))")
+                        }
+                    }
+                }
+                Color.clear.frame(height: 20)
+            }
+            .padding(.horizontal, 8).padding(.top, 6)
+        }
+    }
+
+    private func formatGauge(_ v: Double) -> String {
+        if abs(v - v.rounded()) < 0.001 { return String(Int(v.rounded())) }
+        return String(format: "%.2f", v)
+    }
+}
+
+struct MetricSampleRow: View {
+    let name: String
+    let series: [MetricSample]
+
+    private var latest: Double { series.last?.value ?? 0 }
+    private var peak: Double { series.map(\.value).max() ?? 0 }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(displayName)
+                .font(Theme.mono)
+                .foregroundColor(Theme.textSecondary)
+                .frame(width: 140, alignment: .leading)
+            Sparkline(values: series.map(\.value))
+                .stroke(Color(red: 0.49, green: 0.61, blue: 1.0), lineWidth: 1)
+                .frame(height: 18)
+                .background(Theme.bg)
+            Text(formatLatest)
+                .font(Theme.monoBold)
+                .foregroundColor(Theme.textPrimary)
+                .frame(width: 80, alignment: .trailing)
+        }
+        .padding(.vertical, 1)
+    }
+
+    /// Friendly labels that fit in the panel.
+    private var displayName: String {
+        switch name {
+        case "memory.resident_mb": return "Memory (MB)"
+        case "memory.peak_mb":     return "Peak (MB)"
+        case "cpu.process_pct":    return "CPU (%)"
+        case "fps.avg_1s":         return "FPS"
+        case "fps.hitches_1s":     return "Hitches/s"
+        case "thermal":            return "Thermal"
+        case "battery.level":      return "Battery"
+        case "battery.charging":   return "Charging"
+        default:                   return name
+        }
+    }
+
+    private var formatLatest: String {
+        switch name {
+        case "thermal":
+            // Latest sample carries the state name in fields["state"].
+            if let s = series.last,
+               let state = s.fields["state"]?.value as? String { return state }
+            return "?"
+        case "battery.charging":
+            return latest > 0.5 ? "yes" : "no"
+        case "battery.level":
+            return String(format: "%.0f%%", latest * 100)
+        case "fps.avg_1s":
+            return String(format: "%.0f", latest)
+        case "fps.hitches_1s":
+            return String(format: "%.0f", latest)
+        case "cpu.process_pct":
+            return String(format: "%.1f%%", latest)
+        case "memory.resident_mb", "memory.peak_mb":
+            return String(format: "%.0f", latest)
+        default:
+            return String(format: "%.2f", latest)
+        }
+    }
+}
+
+/// Quick-and-dirty Path-based sparkline. Renders the last N values
+/// normalized to the row's height. Cheap; no animation.
+struct Sparkline: Shape {
+    let values: [Double]
+
+    func path(in rect: CGRect) -> Path {
+        guard values.count > 1 else { return Path() }
+        let minV = values.min() ?? 0
+        let maxV = values.max() ?? 1
+        let range = max(maxV - minV, 0.001)
+        var p = Path()
+        let step = rect.width / CGFloat(values.count - 1)
+        for (i, v) in values.enumerated() {
+            let x = CGFloat(i) * step
+            let norm = (v - minV) / range
+            let y = rect.height - CGFloat(norm) * rect.height
+            if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
+            else      { p.addLine(to: CGPoint(x: x, y: y)) }
+        }
+        return p
+    }
+}
+
+/// Prominent "how long did the app take to launch?" header on the Metrics
+/// tab. Reads the SDK's canonical `metric.launch` event, which fires exactly
+/// once per process (`SimConsole.metric.appFinishLaunching()` is idempotent).
+/// Once captured, the number never moves — revisiting a view doesn't update
+/// it.
+struct LaunchSummaryView: View {
+    let launch: MetricLaunch?
+    let milestoneCount: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("LAUNCH")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(Theme.textDim)
+            if let l = launch {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(l.ms)")
+                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                        .foregroundColor(launchColor(l.ms))
+                    Text("ms")
+                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary)
+                    Spacer()
+                    if milestoneCount > 0 {
+                        Text("\(milestoneCount) milestone\(milestoneCount == 1 ? "" : "s")")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(Theme.textDim)
+                    }
+                }
+            } else {
+                Text("Waiting for launch event…")
+                    .font(Theme.mono)
+                    .foregroundColor(Theme.textSecondary)
+                Text("Bracket your startup with SimConsole.metric.appStartLaunch() and .appFinishLaunching(). Make sure sim-console is running before the app launches.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Theme.textDim)
+            }
+        }
+    }
+
+    /// Apple's published target: <400ms post-main. Industry "good" is <2s.
+    /// Color-coded so it's obvious at a glance whether you're in spec.
+    private func launchColor(_ ms: Int) -> Color {
+        switch ms {
+        case 0..<400:   return Color(red: 0.40, green: 0.85, blue: 0.55)
+        case 400..<2000: return Color(red: 0.95, green: 0.70, blue: 0.30)
+        default:        return Color(red: 1.0, green: 0.45, blue: 0.45)
+        }
+    }
+}
+
+struct LaunchTimelineView: View {
+    let milestones: [MetricMilestone]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text("0ms").font(Theme.mono).foregroundColor(Theme.textDim).frame(width: 70, alignment: .leading)
+                Text("process_start").font(Theme.mono).foregroundColor(Theme.textPrimary)
+            }
+            ForEach(milestones.sorted(by: { $0.msSinceLaunch < $1.msSinceLaunch })) { m in
+                HStack {
+                    Text("\(m.msSinceLaunch)ms")
+                        .font(Theme.mono).foregroundColor(Theme.textDim)
+                        .frame(width: 70, alignment: .leading)
+                    Text(m.name).font(Theme.mono).foregroundColor(Theme.textPrimary)
+                }
+            }
+        }
+    }
+}
+
+struct SignpostRow: View {
+    let signpost: MetricSignpost
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(signpost.name)
+                .font(Theme.mono)
+                .foregroundColor(Theme.textPrimary)
+                .lineLimit(1)
+            Spacer()
+            Text("\(signpost.durationMs)ms")
+                .font(Theme.monoBold)
+                .foregroundColor(durationColor(signpost.durationMs))
+        }
+    }
+    private func durationColor(_ ms: Int) -> Color {
+        switch ms {
+        case 0..<50:    return Color(red: 0.40, green: 0.85, blue: 0.55)
+        case 50..<200:  return Theme.textPrimary
+        case 200..<500: return Color(red: 0.95, green: 0.70, blue: 0.30)
+        default:        return Color(red: 1.0, green: 0.45, blue: 0.45)
+        }
+    }
+}
+
+struct HangRow: View {
+    let hang: MetricHang
+    static let timeFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
+    var body: some View {
+        HStack {
+            Text(Self.timeFmt.string(from: hang.timestamp))
+                .font(Theme.mono).foregroundColor(Theme.textDim)
+                .frame(width: 70, alignment: .leading)
+            Text("hang")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 5).padding(.vertical, 2)
+                .background(Color(red: 1.0, green: 0.45, blue: 0.45).opacity(0.20))
+                .foregroundColor(Color(red: 1.0, green: 0.45, blue: 0.45))
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+            Spacer()
+            Text("\(hang.durationMs)ms")
+                .font(Theme.monoBold).foregroundColor(Color(red: 1.0, green: 0.45, blue: 0.45))
+        }
+    }
+}
+
+struct KVRow: View {
+    let key: String
+    let value: String
+    var body: some View {
+        HStack {
+            Text(key).font(Theme.mono).foregroundColor(Theme.textSecondary)
+            Spacer()
+            Text(value).font(Theme.monoBold).foregroundColor(Theme.textPrimary)
         }
     }
 }

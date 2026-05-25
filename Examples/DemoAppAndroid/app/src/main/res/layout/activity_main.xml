@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="SimConsole demo"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:paddingBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Tap a button — every event surfaces in the macOS panel."
+            android:paddingBottom="16dp" />
+
+        <Button
+            android:id="@+id/btnAnalytics"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Fire analytics event"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnScreen"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Record a screen view"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Emit a log (warn)"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnNetwork"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Run a network request"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnMetric"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Emit a custom gauge + signpost"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnHang"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Block main thread for 600ms (triggers hang)"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Idle."
+            android:paddingTop="16dp"
+            android:textSize="13sp" />
+
+    </LinearLayout>
+</ScrollView>

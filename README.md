@@ -4,17 +4,18 @@
 
 # sim_logs
 
-> **Live structured-log overlay for the iOS Simulator.**
-> Charles + Console.app + analytics inspector, in a borderless SwiftUI panel that snaps beside your simulator window.
+> **Live structured-log overlay for iOS Simulators *and* Android emulators.**
+> Charles + Console.app + analytics inspector, in a borderless SwiftUI panel that snaps beside your sim/emulator window.
 
-Two independent pieces you can adopt one at a time:
+Three pieces, all independent:
 
 | | |
 |---|---|
-| **`sim-console`** | macOS app. Borderless SwiftUI panel positioned beside the running iOS Simulator window via the Accessibility API. Subscribes to `xcrun simctl spawn <UDID> log stream` and renders structured rows for analytics + network events, plus text rows for raw logs / errors. |
-| **`SimConsole`** | Swift Package (iOS 15+). Drop-in SDK your app calls at runtime to emit structured analytics / network / log events via `os.Logger`. The macOS app picks them up over the unified-log channel — no socket, no port, no extra runtime. |
+| **`sim-console`** | macOS panel app. Borderless SwiftUI panel positioned beside the running iOS Simulator or Android emulator. Subscribes to `xcrun simctl spawn ... log stream` on iOS or `adb logcat` on Android and renders structured rows for analytics / network / metric / log events. |
+| **`SimConsole` (iOS)** | Swift Package (iOS 15+). Drop-in SDK your app calls at runtime to emit structured events via `os.Logger`. The panel picks them up over the unified-log channel — no socket, no port, no extra runtime. |
+| **`com.simconsole:simconsole` (Android)** | Kotlin AAR (minSdk 24). Same public API surface as the iOS SDK; emits via `android.util.Log` with stable `SimConsole.<category>` tags. Includes an OkHttp `Interceptor` for network capture and request mocking, plus background samplers for memory / CPU / FPS / hangs. |
 
-The two pieces are independent. You can run `sim-console` against **any iOS app** without integrating the SDK — you'll still get the Errors and All text tabs plus CFNetwork-level traffic. Add the SDK and the Analytics and Network tabs become a real Charles-style inspector with method, status, duration, headers, and request + response bodies.
+All three pieces are independent. You can run `sim-console` against **any iOS or Android app** without integrating the SDK — you'll still get the Errors / All text tabs. Add the SDK and the Analytics / Network / Metrics tabs become a real Charles-style inspector with method, status, duration, headers, and request + response bodies.
 
 ---
 
@@ -103,6 +104,63 @@ SimConsole.track(SimConsole.AnalyticsEvent(
 
 Rebuild, launch on a simulator, and run `./Tools/sim-console.sh <your-bundle-id>` — the Analytics and Network tabs light up.
 
+### 3. (Alternative) Use it against an Android emulator or USB device
+
+```bash
+# One-time: publish the Kotlin AAR to your local Maven repo
+( cd android && ./gradlew :simconsole:publishToMavenLocal )
+```
+
+In your Android app's `settings.gradle.kts`:
+
+```kotlin
+dependencyResolutionManagement {
+    repositories { mavenLocal(); google(); mavenCentral() }
+}
+```
+
+In `app/build.gradle.kts`:
+
+```kotlin
+dependencies {
+    debugImplementation("com.simconsole:simconsole:0.1.0")
+    implementation("com.squareup.okhttp3:okhttp:5.3.2")
+}
+```
+
+Bootstrap in `Application.onCreate()`:
+
+```kotlin
+import com.simconsole.SimConsole
+import com.simconsole.SimConsoleInterceptor
+
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            SimConsole.bootstrap(this, subsystem = BuildConfig.APPLICATION_ID)
+        }
+    }
+}
+
+// In your OkHttpClient.Builder()
+.apply { if (BuildConfig.DEBUG) addInterceptor(SimConsoleInterceptor()) }
+```
+
+Launch the panel:
+
+```bash
+./Tools/sim-console \
+  --platform android --device emulator-5554 --tag "Android Emulator" \
+  --bundle-id com.your.app \
+  --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
+  --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
+  --tab "metric|Metrics|SimConsole.metric:V SimConsole.metric.chunk:V *:S" \
+  --tab "text|Logs|SimConsole.event:V SimConsole.event.chunk:V *:S"
+```
+
+For USB-connected physical devices, append `--detached` (the panel becomes a movable floating window since there's no device window to dock against on the Mac).
+
 ---
 
 ## Use it with an agent (Claude Code skill)
@@ -118,10 +176,10 @@ That symlinks `.claude/skill/SKILL.md` into `~/.claude/skills/sim-console/`. The
 
 | Command | What it does |
 |---|---|
-| `/sim-console install` | Clone (if missing) + build the macOS binary. |
-| `/sim-console integrate` | Wire `SimConsole` into the iOS project the agent is currently in — adds the Swift Package dependency, drops the `bootstrap` call into the `@main` entry point, registers `SimConsoleURLProtocol` on the URLSession factory, all behind `#if DEBUG`. |
-| `/sim-console` (or `/sim-console launch`) | Spawn the panel beside the booted sim, auto-detecting the project's bundle id. |
-| `/sim-console <bundle-id>` | Launch against an explicit bundle id. |
+| `/sim-console install` | Clone (if missing) + build the macOS binary + publish the Android AAR to Maven Local. |
+| `/sim-console integrate` | Auto-detects iOS vs Android from the current directory. iOS: adds Swift Package dependency, bootstrap call, `SimConsoleURLProtocol` registration. Android: adds `debugImplementation` dep, creates/extends `Application` subclass, wires `SimConsoleInterceptor` into OkHttp. All behind `#if DEBUG` / `BuildConfig.DEBUG`. |
+| `/sim-console` (or `/sim-console launch`) | Spawn the panel beside the booted sim/emulator. Auto-picks `--detached` for USB-connected Android devices. |
+| `/sim-console <bundle-id>` | Launch against an explicit bundle / package id. |
 
 The skill is **idempotent** — re-running `install` or `integrate` is safe; it only does work that hasn't been done yet. If you run multiple Claude Code sessions in parallel against different simulators, each `/sim-console` call picks up that session's locked sim automatically (when used alongside a sim-coordination tool).
 
@@ -151,7 +209,9 @@ Tools surface as `mcp__sim_logs__*` in fresh Claude Code sessions. The visual pa
 
 ---
 
-## Try the demo app
+## Try the demo apps
+
+### iOS demo
 
 `Examples/DemoApp/` is a self-contained iOS app that exercises every SDK surface:
 real network endpoints, error / slow / unreachable edge cases, analytics + screen events,
@@ -173,6 +233,39 @@ Then in another terminal:
 ```
 
 Tap around (or flip the **Auto** tab to running) and watch the console populate.
+
+### Android demo
+
+`Examples/DemoAppAndroid/` is the Kotlin counterpart — a single-Activity app with one
+button per event type (analytics, screen, log, network, custom gauge/signpost, and a
+"block main thread" button that demonstrates the hang detector).
+
+```bash
+# One-time: publish the Kotlin SDK to Maven Local
+( cd android && ./gradlew :simconsole:publishToMavenLocal )
+
+# Build + install
+cd Examples/DemoAppAndroid
+./gradlew :app:installDebug
+
+# Launch the app
+adb shell am start -n com.simconsole.demo/.MainActivity
+```
+
+Then launch the panel:
+
+```bash
+./Tools/sim-console --platform android --device emulator-5554 --tag "Android Emulator" \
+  --bundle-id com.simconsole.demo \
+  --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
+  --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
+  --tab "metric|Metrics|SimConsole.metric:V SimConsole.metric.chunk:V *:S" \
+  --tab "text|Logs|SimConsole.event:V SimConsole.event.chunk:V *:S"
+```
+
+Tap each button — events stream into the panel in real time. The network button hits
+`httpbin.org`; drop a mock at `~/.sim-console/mocks-com.simconsole.demo.json` (the panel
+pushes it to the device automatically) to short-circuit the request.
 
 <p align="center">
   <img src="docs/screenshots/demo-app.png" alt="DemoApp Network tab on the iOS Simulator" width="280">
@@ -260,17 +353,34 @@ No socket, no port collision, no broken-pipe handling. The unified log is the tr
 
 ```
 sim_logs/
-├── Package.swift              ← Swift Package: SimConsole library
-├── Sources/SimConsole/        ← SDK (iOS 15+, macOS 11+ for host build)
+├── Package.swift                  ← Swift Package: iOS SimConsole library
+├── Sources/SimConsole/            ← iOS SDK (iOS 15+)
 │   ├── SimConsole.swift
 │   ├── SimConsoleURLProtocol.swift
-│   └── Models.swift           ← Typed-model overloads
-├── Tests/SimConsoleTests/     ← Unit tests
-├── Tools/                     ← macOS console
-│   ├── sim-console.swift
-│   ├── sim-console.sh         ← launcher
-│   └── build.sh
-└── Examples/DemoApp/          ← Self-contained iOS demo
+│   ├── Metric.swift               ← Launch, milestones, signposts, gauges, counters
+│   ├── MetricSampler.swift        ← 1 Hz memory/CPU/FPS/thermal/battery
+│   ├── HangDetector.swift         ← Main-thread watchdog
+│   ├── Mock.swift, MockStore.swift← Request mocking
+│   └── Models.swift               ← Typed-model overloads
+├── android/                       ← Kotlin SDK (minSdk 24)
+│   ├── simconsole/                ← Gradle library module
+│   │   └── src/main/kotlin/com/simconsole/
+│   │       ├── SimConsole.kt
+│   │       ├── SimConsoleInterceptor.kt
+│   │       ├── Metric.kt, MetricSampler.kt, FpsSampler.kt, HangDetector.kt
+│   │       ├── Mock.kt, MockStore.kt
+│   │       └── Envelope.kt, LogChunker.kt
+│   └── gradlew, settings.gradle.kts
+├── Tests/SimConsoleTests/         ← iOS unit tests
+├── Tools/                         ← macOS console (works for both platforms)
+│   ├── sim-console.swift          ← Panel binary source
+│   ├── sim-console.sh             ← Launcher (iOS-only convenience wrapper)
+│   ├── build.sh
+│   └── mcp-server/                ← Python MCP server for agentic queries
+├── Examples/
+│   ├── DemoApp/                   ← Self-contained iOS demo
+│   └── DemoAppAndroid/            ← Self-contained Kotlin demo
+└── .claude/skill/SKILL.md         ← Claude Code skill (auto-detects iOS vs Android)
 ```
 
 ---
@@ -278,9 +388,11 @@ sim_logs/
 ## Requirements
 
 - **macOS 13+** for the console binary (uses SwiftUI features).
-- **iOS 15+** for the SDK.
-- **Xcode 15+** to build the demo.
-- One-time **Accessibility** grant for the terminal you launch `sim-console` from (so it can read the Simulator's window position).
+- **iOS 15+** for the iOS SDK.
+- **Android API 24+ (Android 7.0+)** for the Kotlin SDK. AGP 9.x + Kotlin 2.2+ recommended.
+- **Xcode 15+** to build the iOS demo. **Android Studio Koala+** (or JDK 17 + Android SDK 35) to build the Android demo.
+- One-time **Accessibility** grant for the terminal you launch `sim-console` from (so it can read the Simulator's window position — Android emulators dock via CGWindowList which doesn't need AX).
+- `adb` available on `PATH` or under `~/Library/Android/sdk/platform-tools/` for the Android transport.
 
 ---
 
@@ -289,17 +401,20 @@ sim_logs/
 **Will this slow down my app?**
 No measurable impact in Debug builds. The SDK is essentially `os_log` calls with a few dictionary builds. Don't ship it in Release.
 
-**Does it work with Alamofire / Moya / any other networking library?**
-Yes, as long as they go through `URLSession` (they all do). Register `SimConsoleURLProtocol` on the session config the library uses, or on `URLSession.shared` globally.
+**Does it work with Alamofire / Moya / Retrofit / Ktor?**
+Yes. On iOS, register `SimConsoleURLProtocol` on the `URLSessionConfiguration` they use (Alamofire and Moya both go through `URLSession`). On Android, add `SimConsoleInterceptor` to the central `OkHttpClient.Builder()` — Retrofit and Ktor's OkHttp engine ride on the same client.
 
 **Why not a TCP socket?**
-`os.Logger` already solves the transport problem — it survives backgrounding, sim reboots, port collisions, and works across worktrees. The only cost is `os_log`'s ~1024-byte per-line limit, which we work around by emitting one log entry per header + a separate body event.
+`os.Logger` / `android.util.Log` already solve the transport problem — they survive backgrounding, sim/emulator reboots, port collisions, and work across worktrees. The cost is a per-line truncation limit (~1 KB on iOS, ~4 KB on Android) which we work around by emitting one log entry per header + a separate body event, and by chunking >3.5 KB payloads on Android.
 
-**Does it work on a physical device?**
-The SDK does (it just writes to `os.Logger`), but `sim-console` only reads simulator logs via `xcrun simctl spawn`. For physical devices, `Console.app`'s device-log view shows the same entries.
+**Does it work on a physical Android device over USB?**
+Yes. `adb logcat` works the same against an emulator or a USB-connected phone — pass `--detached` and the panel becomes a movable floating window since there's no on-screen device window to dock against.
+
+**Does it work on a physical iPhone?**
+Not yet. The iOS SDK does (it just writes to `os.Logger`), but `sim-console` currently only reads simulator logs via `xcrun simctl spawn`. Physical-device support over `xcrun devicectl` is on the roadmap.
 
 **Can I customize tabs?**
-Yes — pass `--tab "<kind>|Name|<NSPredicate>"` to `sim-console.sh` (repeatable). `<kind>` is `network`, `analytics`, or `text`. See `./Tools/sim-console.sh --help`.
+Yes — pass `--tab "<kind>|Name|<filter>"` (repeatable). `<kind>` is `network`, `analytics`, `text`, or `metric`. On iOS `<filter>` is an `NSPredicate`; on Android it's an `adb logcat` filterspec like `SimConsole.analytics:V *:S`.
 
 ---
 

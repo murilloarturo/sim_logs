@@ -138,11 +138,15 @@ class SimConsoleInterceptor : Interceptor {
         }
         val response = builder.build()
 
+        // For the emitted event, surface the *mock's* declared headers (including
+        // Content-Type / Content-Length) so the panel shows what the host app's
+        // caller would observe. The `response.headers` list omits Content-Type
+        // because we attached it via the ResponseBody MediaType instead.
         SimConsole.networkResponse(
             id = id,
             status = response.code,
             durationMs = elapsedMs(startedNanos),
-            headers = headerMap(response.headers),
+            headers = mock.response.headers,
             body = bodyText.ifEmpty { null },
             byteSize = bodyText.toByteArray(Charsets.UTF_8).size,
             mocked = true,

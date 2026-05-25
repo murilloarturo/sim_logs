@@ -1,9 +1,9 @@
 ---
 name: sim-console
-description: Install, integrate, and launch sim_logs — a live structured-log overlay that sits beside the iOS Simulator and renders structured analytics + network rows from an in-app SDK (SimConsole). Use when the user wants to view live analytics events, network requests, or structured logs from an iOS app running on a simulator, when they say things like "open sim-console", "show me the network logs", "integrate sim_logs into this project", or "install sim-console". Three sub-commands: `install` (clone repo + build binary), `integrate` (add the SwiftPM dependency + bootstrap call + URLProtocol to the current iOS project), `launch` (run the macOS panel beside the booted simulator). The skill is the single entry point — never have the user run shell commands by hand.
+description: Install, integrate, and launch sim_logs — a live structured-log overlay that sits beside an iOS Simulator OR Android emulator and renders structured analytics + network + metric rows from an in-app SDK (SimConsole). Use when the user wants to view live analytics events, network requests, or structured logs from an iOS / Android app running on a simulator/emulator, when they say things like "open sim-console", "show me the network logs", "integrate sim_logs into this project", or "install sim-console". Auto-detects iOS vs Android from the current directory. Three sub-commands: `install` (clone repo + build binary + publish Android SDK to Maven Local), `integrate` (wire the SDK into the current iOS or Android project), `launch` (run the macOS panel beside the booted sim/emulator). The skill is the single entry point — never have the user run shell commands by hand.
 ---
 
-This skill manages **sim_logs** — a developer tool that streams structured analytics, network, and log events from an iOS app onto a SwiftUI panel beside the Simulator window. The companion in-app SDK (`SimConsole`) emits JSON via `os.Logger` and the macOS app (`sim-console`) renders typed rows.
+This skill manages **sim_logs** — a developer tool that streams structured analytics, network, and log events from an iOS or Android app onto a SwiftUI panel beside the sim/emulator window. The companion in-app SDKs (`SimConsole` for both platforms) emit JSON envelopes that the macOS app (`sim-console`) renders as typed rows.
 
 Project URL: `https://github.com/murilloarturo/sim_logs`
 
@@ -36,9 +36,31 @@ SIM_LOGS_REPO="git@github.com:murilloarturo/sim_logs.git"
 
 ---
 
+## P0 — Detect target platform
+
+For `integrate` and `launch`, decide whether the current working directory is an iOS or Android project **before** branching into platform-specific steps. Run this once at the top:
+
+```bash
+# iOS markers (any one matches)
+IOS_MARKERS=( "project.yml" "Package.swift" "*.xcodeproj" "*.xcworkspace" )
+# Android markers (must have both gradle settings + an app module)
+ANDROID_SETTINGS=( "settings.gradle.kts" "settings.gradle" )
+ANDROID_BUILDS=(   "app/build.gradle.kts" "app/build.gradle" )
+```
+
+Priority rules:
+1. Both present (very rare — KMP repo) → ask the user which one to target.
+2. Only iOS markers → `PLATFORM=ios`.
+3. Only Android markers → `PLATFORM=android`.
+4. Neither → stop. This isn't a project we know how to integrate.
+
+Save `PLATFORM` and reuse it everywhere downstream.
+
+---
+
 ## I — `install` sub-command
 
-Goal: leave `$SIM_LOGS_HOME` with a built `sim-console` binary, ready to launch.
+Goal: leave `$SIM_LOGS_HOME` with a built `sim-console` binary AND the Android SDK published to the user's Maven Local repo, both ready to launch.
 
 ```bash
 # 1. Clone if missing
@@ -58,7 +80,18 @@ if [ ! -x "$SIM_CONSOLE_BIN" ] || [ "$SIM_LOGS_HOME/Tools/sim-console.swift" -nt
   "$SIM_LOGS_HOME/Tools/build.sh"
 fi
 
+# 4. Publish the Android SDK to ~/.m2 so Gradle consumers can pick it up
+#    via `mavenLocal()` + implementation("com.simconsole:simconsole:0.1.0").
+#    Skip if the AAR is already there and newer than any source file.
+M2_AAR="$HOME/.m2/repository/com/simconsole/simconsole/0.1.0/simconsole-0.1.0.aar"
+NEWEST_SRC=$(find "$SIM_LOGS_HOME/android/simconsole/src" -name "*.kt" -newer "$M2_AAR" 2>/dev/null | head -1)
+if [ ! -f "$M2_AAR" ] || [ -n "$NEWEST_SRC" ]; then
+  ( cd "$SIM_LOGS_HOME/android" && ./gradlew :simconsole:publishToMavenLocal --console=plain --no-daemon )
+fi
+
 echo "✓ sim_logs ready at $SIM_LOGS_HOME"
+echo "  panel binary: $SIM_CONSOLE_BIN"
+echo "  android SDK:  com.simconsole:simconsole:0.1.0 (Maven Local)"
 ```
 
 If the SSH clone fails (no key configured for the user's GitHub), fall back to HTTPS:
@@ -72,7 +105,133 @@ Output a clear message about which clone form succeeded so the user knows the st
 
 ## I — `integrate` sub-command
 
-Wire `SimConsole` into the current iOS project (debug builds only). The flow has three steps; check the state of each before acting, and only do what's needed.
+Wire `SimConsole` into the current project (debug builds only). Branch on `PLATFORM` from the P0 detection step. The iOS flow is **Section iOS-I** below; the Android flow is **Section ANDROID-I**.
+
+---
+
+## Section ANDROID-I — `integrate` on Android
+
+### A1 — Detect the Android project layout
+
+Confirm there's a top-level `settings.gradle{,.kts}` and at least one module with `applicationId` (typically `app/`). Extract the package id:
+
+```bash
+APP_GRADLE=$(ls app/build.gradle.kts app/build.gradle 2>/dev/null | head -1)
+# applicationId can be a literal or a property reference. Handle both:
+APPLICATION_ID=$(grep -E '^\s*applicationId\s*=\s*"' "$APP_GRADLE" \
+  | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+# If empty, fall back to namespace + variant suffix, or ask the user.
+```
+
+If the app module is named something other than `app/`, look at `settings.gradle.kts` for `include(":<name>")` declarations and find the one whose `build.gradle{,.kts}` declares `id("com.android.application")`.
+
+### A2 — Add the SimConsole dependency
+
+Two edits, both narrow:
+
+**1. Add `mavenLocal()` to the repos** in `settings.gradle.kts` (or the root `build.gradle.kts` if that's where `repositories {}` lives). Most projects already have `mavenLocal()` listed; if so, skip.
+
+```kotlin
+// settings.gradle.kts (dependencyResolutionManagement block)
+repositories {
+    google()
+    mavenCentral()
+    mavenLocal()    // ← add
+}
+```
+
+**2. Add a `debugImplementation` dependency** to the app module:
+
+```kotlin
+// app/build.gradle.kts
+dependencies {
+    debugImplementation("com.simconsole:simconsole:0.1.0")
+}
+```
+
+`debugImplementation` keeps the SDK out of release builds entirely — there's no `#if DEBUG` equivalent in Kotlin/Android, so we rely on build-variant scoping. If the project uses a different debuggable variant (e.g. `staging`), prefer the matching `<variant>Implementation` configuration.
+
+### A3 — Add the bootstrap call
+
+Find or create the `Application` subclass. Two cases:
+
+**Case 1 — existing Application subclass.** Look in `AndroidManifest.xml`:
+```xml
+<application android:name=".MyApp" ...>
+```
+Open the named class and add to `onCreate()`:
+```kotlin
+import com.simconsole.SimConsole
+
+override fun onCreate() {
+    super.onCreate()
+    if (BuildConfig.DEBUG) {
+        SimConsole.bootstrap(this, subsystem = BuildConfig.APPLICATION_ID)
+    }
+    // ... rest of existing onCreate
+}
+```
+
+**Case 2 — no Application subclass.** Create one in `app/src/main/java/<package>/SimConsoleApp.kt`:
+```kotlin
+package <package>
+
+import android.app.Application
+import com.simconsole.SimConsole
+
+class SimConsoleApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            SimConsole.bootstrap(this, subsystem = BuildConfig.APPLICATION_ID)
+        }
+    }
+}
+```
+And register it in `AndroidManifest.xml`:
+```xml
+<application android:name=".SimConsoleApp" ...>
+```
+
+Use `applicationContext` implicitly — `this` inside `Application.onCreate` is already the app context.
+
+### A4 — Wire SimConsoleInterceptor into OkHttp
+
+Search for `OkHttpClient.Builder()`:
+```bash
+grep -rn "OkHttpClient.Builder()" app/src/main --include="*.kt"
+```
+
+The right place is the **central** factory that builds the client used by Retrofit / Ktor / direct `Call.execute()`. Add the interceptor:
+
+```kotlin
+import com.simconsole.SimConsoleInterceptor
+
+val client = OkHttpClient.Builder()
+    .apply { if (BuildConfig.DEBUG) addInterceptor(SimConsoleInterceptor()) }
+    // ... existing interceptors
+    .build()
+```
+
+Place this **last** so it sees retry-final requests but before any compression interceptor that might mangle the body. If the project uses **Retrofit** or **Ktor with OkHttp engine**, both surface the same client — wire it once at the OkHttp layer.
+
+If there's no central factory and the client is built ad-hoc in multiple places, ask the user where to wire it; don't blindly modify every constructor.
+
+### A5 — Build + verify
+
+```bash
+./gradlew :app:assembleDebug --console=plain 2>&1 | tail -20
+```
+
+If it fails with `Could not resolve com.simconsole:simconsole:0.1.0`, the Android SDK wasn't published — re-run `/sim-console install` which now also publishes to Maven Local.
+
+If `BuildConfig.DEBUG` is unresolved, the consumer's variant doesn't generate `BuildConfig` — replace with a literal `true` (the dependency is already debug-scoped via `debugImplementation`).
+
+---
+
+## Section iOS-I — `integrate` on iOS
+
+The flow has three steps; check the state of each before acting, and only do what's needed.
 
 ### Step 1 — Detect the iOS project layout
 
@@ -174,11 +333,77 @@ Confirm it links cleanly. If it fails on "no such module 'SimConsole'", the proj
 
 ## I — `launch` sub-command (default)
 
-Goal: spawn the `sim-console` panel beside the booted simulator, targeting the current project's app.
+Goal: spawn the `sim-console` panel beside the booted simulator/emulator, targeting the current project's app. Branch on `PLATFORM`.
 
-### L1 — Ensure binary is built
+### L1 — Ensure binary is built (both platforms)
 
-Call the `install` sub-command logic first (idempotent — fast no-op if already built).
+Call the `install` sub-command logic first (idempotent — fast no-op if already built). On Android this also ensures the SDK is in Maven Local in case the user is launching for the first time on a freshly-checked-out machine.
+
+---
+
+## Section ANDROID-L — `launch` on Android
+
+### A-L2 — Resolve the target emulator
+
+```bash
+# Pick the first booted emulator. If multiple, prefer one tagged in adb output.
+SERIAL=$(adb devices | awk '/emulator-[0-9]+\s+device/ { print $1; exit }')
+if [ -z "$SERIAL" ]; then
+  echo "No Android emulator booted. Start one in Android Studio or with"
+  echo "  emulator -avd <name>"
+  exit 1
+fi
+```
+
+If multiple emulators are booted, ask the user which one — we don't have an Android equivalent of `sim-lock` yet.
+
+### A-L3 — Resolve the package id
+
+- If the user passed `<bundle-id>` as argument, use that.
+- Otherwise re-run the A1 detection (`grep applicationId app/build.gradle{,.kts}`).
+- Fall back to asking the user.
+
+### A-L4 — Confirm app is installed on the emulator
+
+```bash
+adb -s "$SERIAL" shell pm list packages "$APPLICATION_ID" | grep -q "$APPLICATION_ID"
+```
+
+If not, tell the user to `./gradlew :app:installDebug` (or run via Android Studio) first — don't try to install yourself.
+
+### A-L5 — Spawn the panel
+
+```bash
+"$SIM_CONSOLE_BIN" \
+  --platform android \
+  --device "$SERIAL" \
+  --tag "Android Emulator" \
+  --bundle-id "$APPLICATION_ID" \
+  --width 560 --gap 8 --side right \
+  --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
+  --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
+  --tab "metric|Metrics|SimConsole.metric:V SimConsole.metric.chunk:V *:S" \
+  --tab "text|Logs|SimConsole.event:V SimConsole.event.chunk:V *:S" \
+  --tab "text|Errors|*:E *:F" \
+  --tab "text|All|*:V"
+```
+
+Notes:
+- The `--tag "Android Emulator"` argument is accepted for symmetry with the iOS path but unused on Android — the panel docks against the qemu window via `CGWindowListCopyWindowInfo` regardless of title.
+- Each `--tab` for Android takes a **logcat filterspec** as the third pipe-separated field (not an NSPredicate). The `*:S` suffix silences everything else; omit it for the All/Errors tabs which want to see other tags.
+- `--bundle-id` enables MockSync — the panel will `adb push` `~/.sim-console/mocks-<pkg>.json` to `/data/local/tmp/` on every mock edit.
+
+Kill any previous panel first:
+```bash
+pkill -f "sim-console --platform" 2>/dev/null
+sleep 1
+```
+
+Report back which emulator + package id were chosen so the user can sanity-check.
+
+---
+
+## Section iOS-L — `launch` on iOS
 
 ### L2 — Resolve the target sim
 
@@ -244,13 +469,13 @@ Report back which sim + bundle id were chosen so the user can sanity-check.
 
 ## When to use this skill
 
-- "Show me the analytics events from this app" → `/sim-console launch`
-- "What network requests is this app making?" → `/sim-console launch`
-- "Add sim_logs to this project" → `/sim-console integrate`
+- "Show me the analytics events from this app" → `/sim-console launch` (iOS or Android — auto-detects)
+- "What network requests is this Android app making?" → `/sim-console launch`
+- "Add sim_logs to this iOS / Android project" → `/sim-console integrate`
 - "I want to see what's going on in the app live" → `/sim-console launch`
 - "Set up sim-console on this Mac" → `/sim-console install`
 
-If the user asks to "see the logs" in a debugger / Xcode sense, they probably want `/runluzia logs` instead (raw unified log stream). `/sim-console` is for **structured** event viewing.
+If the user asks to "see the logs" in a debugger / Xcode / Android Studio sense, they probably want raw `xcrun simctl spawn ... log stream` or `adb logcat` directly. `/sim-console` is for **structured** event viewing of JSON envelopes emitted by the SimConsole SDK.
 
 ---
 

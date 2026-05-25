@@ -33,14 +33,20 @@ import Combine
 // ---------------------------------------------------------------------------
 // MARK: - CLI args
 
+enum Platform: String { case ios, android }
+
 struct TabSpec {
     enum Kind: String { case network, analytics, text, metric }
     let kind: Kind
     let name: String
+    /// Source-filter expression. On iOS this is an NSPredicate passed to
+    /// `simctl spawn log stream --predicate`. On Android it's the trailing
+    /// filterspec passed to `adb logcat`, e.g. `SimConsole.analytics:V *:S`.
     let predicate: String
 }
 
 struct Args {
+    var platform: Platform = .ios
     var device = ""
     var tag = ""
     var altTag = ""
@@ -53,6 +59,8 @@ struct Args {
     var tabs: [TabSpec] = []
     var exportTo: String = ""
     var bundleId: String = ""
+    /// Path to the `adb` binary. Discovered at startup when empty.
+    var adbPath: String = ""
 }
 
 func parseColor(_ hex: String) -> Color? {
@@ -96,10 +104,34 @@ func parseArgs() -> Args {
             i += 2
         case "--export-to": a.exportTo = argv[i+1]; i += 2
         case "--bundle-id": a.bundleId = argv[i+1]; i += 2
+        case "--platform":
+            if let p = Platform(rawValue: argv[i+1]) { a.platform = p }
+            i += 2
+        case "--adb-path":  a.adbPath = argv[i+1]; i += 2
         default: i += 1
         }
     }
+    if a.platform == .android && a.adbPath.isEmpty {
+        a.adbPath = resolveAdbPath()
+    }
     return a
+}
+
+/// Resolve a path to `adb`. GUI-launched processes don't inherit the user's
+/// shell PATH, so we probe common install locations explicitly before falling
+/// back to the bare command name.
+func resolveAdbPath() -> String {
+    let candidates = [
+        ProcessInfo.processInfo.environment["ADB"] ?? "",
+        NSHomeDirectory() + "/Library/Android/sdk/platform-tools/adb",
+        "/opt/homebrew/bin/adb",
+        "/usr/local/bin/adb",
+        "/usr/bin/adb",
+    ]
+    for c in candidates where !c.isEmpty && FileManager.default.isExecutableFile(atPath: c) {
+        return c
+    }
+    return "adb"
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +213,53 @@ func simulatorAppRunning() -> Bool {
     NSWorkspace.shared.runningApplications.contains {
         $0.bundleIdentifier == "com.apple.iphonesimulator"
     }
+}
+
+/// The Android Emulator (`qemu-system-*`) isn't a bundled `.app` so neither
+/// `NSWorkspace.runningApplications` nor AX surfaces its windows directly. We
+/// query the window server instead via `CGWindowListCopyWindowInfo`, which
+/// enumerates every on-screen window by owner process name. Returns the
+/// device-screen window's frame in CGWindow top-down coordinates, ready to
+/// flip through `axToCocoa(_:)`.
+///
+/// `tag` is accepted for symmetry with the iOS lookup but currently unused —
+/// qemu windows have empty titles, so we identify by owner name plus pick the
+/// largest layer-0 window (which is always the device screen; toolbars and
+/// extended controls are smaller / on higher layers).
+func findEmulatorWindowFrame(matching tag: String = "") -> CGRect? {
+    let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+    var best: CGRect?
+    var bestArea: CGFloat = 0
+    for w in list {
+        let owner = (w[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+        guard owner.hasPrefix("qemu") else { continue }
+        guard (w[kCGWindowLayer as String] as? Int ?? -1) == 0 else { continue }
+        guard let bnds = w[kCGWindowBounds as String] as? [String: NSNumber] else { continue }
+        let x = CGFloat(truncating: bnds["X"] ?? 0)
+        let y = CGFloat(truncating: bnds["Y"] ?? 0)
+        let width = CGFloat(truncating: bnds["Width"] ?? 0)
+        let height = CGFloat(truncating: bnds["Height"] ?? 0)
+        // Skip degenerate / hidden surfaces — the device screen is always
+        // taller than the toolbar widgets.
+        guard width > 0, height > 100 else { continue }
+        let area = width * height
+        if area > bestArea {
+            bestArea = area
+            best = CGRect(x: x, y: y, width: width, height: height)
+        }
+    }
+    return best
+}
+
+/// Mirrors `simulatorAppRunning()`. CGWindowList sees qemu's windows even
+/// though it has no app bundle, so we just check whether any survive.
+func emulatorAppRunning() -> Bool {
+    let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+    for w in list {
+        let owner = (w[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+        if owner.hasPrefix("qemu") { return true }
+    }
+    return false
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +505,75 @@ final class Exporter {
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - Chunk reassembly
+
+/// Reassembles oversized payloads that the Android SDK splits across multiple
+/// logcat lines. Each piece is a `{kind:"chunk", id, i, n, part}` envelope; we
+/// buffer them by `id` and surface the concatenated `part`s as a single JSON
+/// string once all `n` pieces have arrived.
+///
+/// Used by every tab — iOS doesn't currently chunk, but the assembler is a
+/// no-op for non-chunk lines so wiring it unconditionally has zero cost and
+/// keeps the dispatch path identical across platforms.
+final class ChunkAssembler {
+    private struct Pending {
+        let total: Int
+        var parts: [Int: String]
+        var firstSeen: Date
+    }
+    private var pending: [String: Pending] = [:]
+    /// Drop incomplete chunk groups after this many seconds — bounds memory in
+    /// the face of a dropped device or crashed emitter that never finished a set.
+    private let ttl: TimeInterval = 30
+
+    /// Returns the line (or reassembled JSON) ready for downstream parsing, or
+    /// `nil` if `rawLine` was a chunk envelope and we're still waiting for more.
+    func absorb(_ rawLine: String) -> String? {
+        // Fast path: most log lines aren't chunk envelopes. Parse JSON only
+        // when the marker substring is present. Tolerate optional whitespace
+        // around the colon so the panel handles JSON from pretty-printers and
+        // bridges as well as the compact form the SDK emits.
+        guard rawLine.contains("\"kind\":\"chunk\"") ||
+              rawLine.contains("\"kind\": \"chunk\"")
+        else { return rawLine }
+
+        guard let payload = Self.extractJson(rawLine),
+              let data = payload.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (obj["kind"] as? String) == "chunk",
+              let id = obj["id"] as? String,
+              let i = obj["i"] as? Int,
+              let n = obj["n"] as? Int,
+              let part = obj["part"] as? String
+        else {
+            // Looked like a chunk but didn't parse — let the caller try normal dispatch.
+            return rawLine
+        }
+
+        gcExpired()
+        var pen = pending[id] ?? Pending(total: n, parts: [:], firstSeen: Date())
+        pen.parts[i] = part
+        pending[id] = pen
+
+        if pen.parts.count >= n {
+            pending.removeValue(forKey: id)
+            return (0..<n).compactMap { pen.parts[$0] }.joined()
+        }
+        return nil
+    }
+
+    private func gcExpired() {
+        let cutoff = Date().addingTimeInterval(-ttl)
+        pending = pending.filter { $0.value.firstSeen > cutoff }
+    }
+
+    private static func extractJson(_ line: String) -> String? {
+        guard let r = line.range(of: "{") else { return nil }
+        return String(line[r.lowerBound...]).replacingOccurrences(of: "\\134", with: "\\")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Tab view model
 
 final class TabViewModel: ObservableObject, Identifiable {
@@ -439,6 +587,7 @@ final class TabViewModel: ObservableObject, Identifiable {
     private var carry: String = ""
     private var requestIndex: [String: Int] = [:]  // net id → position in entries
     private let maxEntries: Int = 1000
+    private let chunker = ChunkAssembler()
     weak var exporter: Exporter?
 
     init(spec: TabSpec) {
@@ -446,7 +595,14 @@ final class TabViewModel: ObservableObject, Identifiable {
         self.spec = spec
     }
 
-    func start(device: String, level: String) {
+    func start(args: Args) {
+        switch args.platform {
+        case .ios:     startIOS(device: args.device, level: args.level)
+        case .android: startAndroid(serial: args.device, adbPath: args.adbPath)
+        }
+    }
+
+    private func startIOS(device: String, level: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
         proc.arguments = [
@@ -455,6 +611,29 @@ final class TabViewModel: ObservableObject, Identifiable {
             "--level", level,
             "--style", "compact"
         ]
+        runStreamingProcess(proc, label: "ios")
+    }
+
+    /// Spawn `adb logcat -v threadtime -T 1 <filterspec>`. The `-T 1` flag skips
+    /// the device's log backlog so we only see events generated after the panel
+    /// starts. `spec.predicate` carries the logcat filterspec verbatim (e.g.
+    /// `"SimConsole.analytics:V SimConsole.analytics.chunk:V *:S"`).
+    private func startAndroid(serial: String, adbPath: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: adbPath.hasPrefix("/") ? adbPath : "/usr/bin/env")
+        var argv: [String] = []
+        if !adbPath.hasPrefix("/") { argv.append(adbPath) }
+        if !serial.isEmpty { argv.append(contentsOf: ["-s", serial]) }
+        argv.append(contentsOf: ["logcat", "-v", "threadtime", "-T", "1"])
+        // Split the filterspec on whitespace so each token is its own argv slot
+        // — `adb logcat` expects them as separate args, not a single space-joined string.
+        let filterTokens = spec.predicate.split(separator: " ").map(String.init)
+        argv.append(contentsOf: filterTokens)
+        proc.arguments = argv
+        runStreamingProcess(proc, label: "android")
+    }
+
+    private func runStreamingProcess(_ proc: Process, label: String) {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
@@ -469,9 +648,9 @@ final class TabViewModel: ObservableObject, Identifiable {
         do {
             try proc.run()
             self.process = proc
-            diag("tab '\(spec.name)' pid=\(proc.processIdentifier) predicate=\(spec.predicate)")
+            diag("tab '\(spec.name)' [\(label)] pid=\(proc.processIdentifier) filter=\(spec.predicate)")
         } catch {
-            diag("tab '\(spec.name)' stream failed: \(error)")
+            diag("tab '\(spec.name)' [\(label)] stream failed: \(error)")
         }
     }
 
@@ -495,11 +674,15 @@ final class TabViewModel: ObservableObject, Identifiable {
 
     private func ingest(_ rawLine: String) {
         if Self.isBoilerplate(rawLine) { return }
+        // Reassemble Android-side chunked envelopes before per-kind dispatch.
+        // For non-chunk lines this returns the input unchanged. For partial
+        // chunks it returns nil and the line is swallowed until the set completes.
+        guard let resolved = chunker.absorb(rawLine) else { return }
         switch spec.kind {
-        case .network:   ingestNetwork(rawLine)
-        case .analytics: ingestAnalytics(rawLine)
-        case .text:      ingestText(rawLine)
-        case .metric:    ingestMetric(rawLine)
+        case .network:   ingestNetwork(resolved)
+        case .analytics: ingestAnalytics(resolved)
+        case .text:      ingestText(resolved)
+        case .metric:    ingestMetric(resolved)
         }
     }
 
@@ -857,25 +1040,34 @@ final class TabViewModel: ObservableObject, Identifiable {
         return tail.replacingOccurrences(of: "\\134", with: "\\")
     }
 
+    /// Resolve the log-level letter from either iOS `log stream --style compact`
+    /// (3rd token) or Android `logcat -v threadtime` (5th token). The level is
+    /// always the first standalone single-letter token after the timestamp prefix,
+    /// so we just scan tokens until we find a recognized one.
     private static func parseMessageType(_ line: String) -> TextEntry.MessageType {
-        // 3rd whitespace-separated token in compact style is the type letter.
-        let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
-        guard parts.count >= 4 else { return .default }
-        switch String(parts[2]) {
-        case "E":  return .error
-        case "F":  return .fault
-        case "I":  return .info
-        case "Db": return .debug
-        default:   return .default
+        let parts = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: true)
+        for p in parts {
+            switch String(p) {
+            case "E":  return .error
+            case "F":  return .fault
+            case "I":  return .info
+            case "D", "Db": return .debug
+            // "W" (Android warn) and "V" (verbose) fall through to default.
+            default: continue
+            }
         }
+        return .default
     }
 
-    // The `log stream` subprocess emits a few setup lines when it starts.
+    // Setup banners emitted by each transport on startup.
     private static func isBoilerplate(_ line: String) -> Bool {
+        // iOS `log stream --style compact`:
         if line.hasPrefix("getpwuid_r ") { return true }
         if line.hasPrefix("Filtering the log data using ") { return true }
         if line.hasPrefix("Timestamp ") { return true }
         if line.hasPrefix("Skipping info and debug messages") { return true }
+        // Android `adb logcat`:
+        if line.hasPrefix("--------- beginning of") { return true }
         return false
     }
 }
@@ -2255,7 +2447,7 @@ final class Controller {
     }
 
     func start() {
-        for tab in state.tabs { tab.start(device: args.device, level: args.level) }
+        for tab in state.tabs { tab.start(args: args) }
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer, forMode: .common)
         self.refreshTimer = timer
@@ -2263,15 +2455,29 @@ final class Controller {
     }
 
     private func tick() {
-        if !simulatorAppRunning() {
-            diag("Simulator.app no longer running; exiting")
+        let hostRunning: Bool
+        let axRect: CGRect?
+        switch args.platform {
+        case .ios:
+            hostRunning = simulatorAppRunning()
+            if hostRunning,
+               let window = findSimulatorWindow(matching: args.tag, fallback: args.altTag) {
+                axRect = windowFrame(window)
+            } else {
+                axRect = nil
+            }
+        case .android:
+            hostRunning = emulatorAppRunning()
+            axRect = hostRunning ? findEmulatorWindowFrame(matching: args.tag) : nil
+        }
+        if !hostRunning {
+            diag("host (\(args.platform.rawValue)) no longer running; exiting")
             for tab in state.tabs { tab.stop() }
             exit(0)
         }
-        guard let window = findSimulatorWindow(matching: args.tag, fallback: args.altTag) else {
+        guard let axRect else {
             panel.orderOut(nil); return
         }
-        guard let axRect = windowFrame(window) else { return }
         let cocoaRect = axToCocoa(axRect)
 
         let overlayRect: NSRect

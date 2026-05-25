@@ -102,6 +102,116 @@ object SimConsole {
     }
 
     // ---------------------------------------------------------------------
+    // Network
+    //
+    // Three-stage emission per request — mirrors iOS Sources/SimConsole.swift:
+    //   1. net.request   — method + URL + headers + body, when the request fires
+    //   2. net.response  — status + duration + headers + body, when it returns
+    //                      (or net.error if the call failed)
+    //   3. net.header / net.body — one envelope per header and one for the body,
+    //                      so a single bloated header doesn't truncate the row
+    //
+    // The panel pairs everything by `id`. Bodies are clipped to maxBodyChars.
+    // ---------------------------------------------------------------------
+
+    @JvmStatic
+    @JvmOverloads
+    fun networkRequest(
+        id: String,
+        method: String,
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        body: String? = null,
+        mocked: Boolean = false,
+    ) {
+        if (!isEnabled) return
+        val payload = mutableMapOf<String, Any?>(
+            "kind" to "net.request",
+            "t" to now(),
+            "id" to id,
+            "method" to method,
+            "url" to url,
+        )
+        if (mocked) payload["mocked"] = true
+        emit("SimConsole.network", Level.Info, payload)
+        emitHeaders(id, "request", headers)
+        emitBody(id, "request", body)
+    }
+
+    @JvmStatic
+    @JvmOverloads
+    fun networkResponse(
+        id: String,
+        status: Int,
+        durationMs: Int,
+        headers: Map<String, String> = emptyMap(),
+        body: String? = null,
+        byteSize: Int? = null,
+        mocked: Boolean = false,
+    ) {
+        if (!isEnabled) return
+        val payload = mutableMapOf<String, Any?>(
+            "kind" to "net.response",
+            "t" to now(),
+            "id" to id,
+            "status" to status,
+            "duration_ms" to durationMs,
+        )
+        if (byteSize != null) payload["byte_size"] = byteSize
+        if (mocked) payload["mocked"] = true
+        emit("SimConsole.network", Level.Info, payload)
+        emitHeaders(id, "response", headers)
+        emitBody(id, "response", body)
+    }
+
+    @JvmStatic
+    fun networkError(id: String, durationMs: Int, error: String) {
+        if (!isEnabled) return
+        val payload = mapOf<String, Any?>(
+            "kind" to "net.error",
+            "t" to now(),
+            "id" to id,
+            "duration_ms" to durationMs,
+            "error" to error,
+        )
+        emit("SimConsole.network", Level.Warn, payload)
+    }
+
+    private fun emitHeaders(id: String, direction: String, headers: Map<String, String>) {
+        if (headers.isEmpty()) return
+        for ((name, value) in headers) {
+            val payload = mapOf<String, Any?>(
+                "kind" to "net.header",
+                "t" to now(),
+                "id" to id,
+                "direction" to direction,
+                "name" to name,
+                "value" to clip(value).orEmpty(),
+            )
+            emit("SimConsole.network", Level.Info, payload)
+        }
+    }
+
+    private fun emitBody(id: String, direction: String, body: String?) {
+        if (body.isNullOrEmpty()) return
+        val payload = mapOf<String, Any?>(
+            "kind" to "net.body",
+            "t" to now(),
+            "id" to id,
+            "direction" to direction,
+            "body" to clip(body),
+        )
+        emit("SimConsole.network", Level.Info, payload)
+    }
+
+    private fun clip(s: String?): String? {
+        if (s.isNullOrEmpty()) return s
+        val max = maxBodyChars
+        if (s.length <= max) return s
+        return s.substring(0, max) + "…[+${s.length - max} chars]"
+    }
+
+    // ---------------------------------------------------------------------
     // Generic log
     // ---------------------------------------------------------------------
 

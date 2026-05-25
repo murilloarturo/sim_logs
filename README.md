@@ -411,7 +411,7 @@ Yes. On iOS, register `SimConsoleURLProtocol` on the `URLSessionConfiguration` t
 Yes. `adb logcat` works the same against an emulator or a USB-connected phone — pass `--detached` and the panel becomes a movable floating window since there's no on-screen device window to dock against.
 
 **Does it work on a physical iPhone?**
-Not yet. The iOS SDK does (it just writes to `os.Logger`), but `sim-console` currently only reads simulator logs via `xcrun simctl spawn`. Physical-device support over `xcrun devicectl` is on the roadmap.
+Yes (iOS 17+). Pass `--platform ios --detached --device <UDID>` and the panel spawns `idevicesyslog` from libimobiledevice instead of `simctl spawn` (since `xcrun devicectl` doesn't have a log-stream subcommand). Mock-push goes through `xcrun devicectl device copy to --domain-type appDataContainer`. The panel becomes a movable floating window since there's no on-screen iPhone window to dock against. Install `idevicesyslog` once with `brew install libimobiledevice` (the `/sim-console install` skill does this automatically).
 
 **Can I customize tabs?**
 Yes — pass `--tab "<kind>|Name|<filter>"` (repeatable). `<kind>` is `network`, `analytics`, `text`, or `metric`. On iOS `<filter>` is an `NSPredicate`; on Android it's an `adb logcat` filterspec like `SimConsole.analytics:V *:S`.

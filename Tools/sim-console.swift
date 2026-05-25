@@ -61,6 +61,10 @@ struct Args {
     var bundleId: String = ""
     /// Path to the `adb` binary. Discovered at startup when empty.
     var adbPath: String = ""
+    /// Path to `idevicesyslog` (libimobiledevice). Discovered at startup when
+    /// empty. Used for streaming logs from a USB-connected iPhone since
+    /// `xcrun devicectl` doesn't have a log-stream subcommand.
+    var ideviceSyslogPath: String = ""
     /// When true, the panel is a user-positionable floating window rather
     /// than a borderless overlay that tracks the sim/emulator. Required for
     /// USB-connected physical devices (no on-screen device window to dock to).
@@ -112,12 +116,16 @@ func parseArgs() -> Args {
             if let p = Platform(rawValue: argv[i+1]) { a.platform = p }
             i += 2
         case "--adb-path":  a.adbPath = argv[i+1]; i += 2
+        case "--idevicesyslog-path": a.ideviceSyslogPath = argv[i+1]; i += 2
         case "--detached":  a.detached = true; i += 1
         default: i += 1
         }
     }
     if a.platform == .android && a.adbPath.isEmpty {
         a.adbPath = resolveAdbPath()
+    }
+    if a.platform == .ios && a.detached && a.ideviceSyslogPath.isEmpty {
+        a.ideviceSyslogPath = resolveIdeviceSyslogPath()
     }
     return a
 }
@@ -137,6 +145,20 @@ func resolveAdbPath() -> String {
         return c
     }
     return "adb"
+}
+
+/// Resolve `idevicesyslog` (from libimobiledevice). Homebrew installs to
+/// `/opt/homebrew/bin/` on Apple Silicon and `/usr/local/bin/` on Intel.
+func resolveIdeviceSyslogPath() -> String {
+    let candidates = [
+        ProcessInfo.processInfo.environment["IDEVICESYSLOG"] ?? "",
+        "/opt/homebrew/bin/idevicesyslog",
+        "/usr/local/bin/idevicesyslog",
+    ]
+    for c in candidates where !c.isEmpty && FileManager.default.isExecutableFile(atPath: c) {
+        return c
+    }
+    return "idevicesyslog"
 }
 
 // ---------------------------------------------------------------------------
@@ -639,12 +661,18 @@ final class TabViewModel: ObservableObject, Identifiable {
 
     func start(args: Args) {
         switch args.platform {
-        case .ios:     startIOS(device: args.device, level: args.level)
-        case .android: startAndroid(serial: args.device, adbPath: args.adbPath)
+        case .ios:
+            if args.detached {
+                startIOSDevice(udid: args.device, ideviceSyslogPath: args.ideviceSyslogPath, bundleId: args.bundleId)
+            } else {
+                startIOSSimulator(device: args.device, level: args.level)
+            }
+        case .android:
+            startAndroid(serial: args.device, adbPath: args.adbPath)
         }
     }
 
-    private func startIOS(device: String, level: String) {
+    private func startIOSSimulator(device: String, level: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
         proc.arguments = [
@@ -653,7 +681,36 @@ final class TabViewModel: ObservableObject, Identifiable {
             "--level", level,
             "--style", "compact"
         ]
-        runStreamingProcess(proc, label: "ios")
+        runStreamingProcess(proc, label: "ios-sim")
+    }
+
+    /// Spawn `idevicesyslog -u <udid> [-p <proc>]` for USB-connected iPhones.
+    /// Output format is similar enough to `log stream --style compact` that
+    /// the existing JSON-substring extractor works without changes.
+    ///
+    /// `xcrun devicectl` was the originally planned tool but it has no
+    /// log-stream subcommand — only `launch / signal / suspend / resume`.
+    /// libimobiledevice's `idevicesyslog` is the only off-the-shelf path
+    /// that surfaces the unified log from a paired USB device.
+    private func startIOSDevice(udid: String, ideviceSyslogPath: String, bundleId: String) {
+        let proc = Process()
+        let path = ideviceSyslogPath.isEmpty ? "idevicesyslog" : ideviceSyslogPath
+        proc.executableURL = URL(fileURLWithPath: path.hasPrefix("/") ? path : "/usr/bin/env")
+        var argv: [String] = []
+        if !path.hasPrefix("/") { argv.append(path) }
+        if !udid.isEmpty { argv.append(contentsOf: ["-u", udid]) }
+        // `-x` makes idevicesyslog exit when the device disconnects, which
+        // tickDetached picks up via the dead subprocess.
+        argv.append("-x")
+        // Filter to the target app's process when we know the bundle id.
+        // idevicesyslog filters by process name, which equals the bundle's
+        // CFBundleExecutable — close enough for the common case where the
+        // executable name is the same as the last component of the bundle id.
+        if !bundleId.isEmpty {
+            argv.append(contentsOf: ["-p", bundleId.split(separator: ".").last.map(String.init) ?? bundleId])
+        }
+        proc.arguments = argv
+        runStreamingProcess(proc, label: "ios-device")
     }
 
     /// Spawn `adb logcat -v threadtime -T 1 <filterspec>`. The `-T 1` flag skips
@@ -2234,6 +2291,64 @@ final class MockSync {
     }
 }
 
+/// iOS counterpart of [MockSync] — pushes the panel-managed mock file into a
+/// USB-connected iPhone's app sandbox via
+/// `xcrun devicectl device copy to --domain-type appDataContainer`. The
+/// destination lands at `Documents/sim-console/mocks.json` inside the app,
+/// which the iOS SDK's [MockStore] reads via stat-poll.
+///
+/// On a simulator the panel doesn't need this — the simulator can read the
+/// host file directly through `SIMULATOR_HOST_HOME`.
+final class IOSMockSync {
+    private let bundleId: String
+    private let udid: String
+    private let localPath: String
+    private let queue = DispatchQueue(label: "sim-console.ios-mock-sync", qos: .utility)
+    private var cancellable: Any?
+
+    init(store: MockStore, udid: String) {
+        self.bundleId = store.bundleId
+        self.udid = udid
+        self.localPath = store.path
+
+        // Initial push so the device picks up whatever's already on disk.
+        pushNow()
+
+        // Subscribe to mock changes. `devicectl copy` is heavier than `adb
+        // push` (the Core Device tunnel adds 200-500ms) so we explicitly use
+        // a background queue and serialize updates.
+        self.cancellable = store.$mocks
+            .receive(on: queue)
+            .sink { [weak self] _ in self?.pushNow() }
+    }
+
+    private func pushNow() {
+        guard FileManager.default.fileExists(atPath: localPath) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        var argv: [String] = [
+            "devicectl", "device", "copy", "to",
+            "--domain-type", "appDataContainer",
+            "--domain-identifier", bundleId,
+            "--source", localPath,
+            "--destination", "Documents/sim-console/mocks.json",
+        ]
+        if !udid.isEmpty { argv.append(contentsOf: ["--device", udid]) }
+        proc.arguments = argv
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus != 0 {
+                diag("IOSMockSync: devicectl copy failed (exit \(proc.terminationStatus)) for \(bundleId)")
+            }
+        } catch {
+            diag("IOSMockSync: devicectl spawn failed: \(error)")
+        }
+    }
+}
+
 final class MockStore: ObservableObject {
     @Published private(set) var mocks: [Mock] = []
     let bundleId: String
@@ -2515,6 +2630,7 @@ final class Controller {
     var lastFrame: NSRect = .zero
     var refreshTimer: Timer?
     var mockSync: MockSync?
+    var iosMockSync: IOSMockSync?
     let frameStore: PanelFrameStore?
     private var frameObserver: NSObjectProtocol?
 
@@ -2534,6 +2650,11 @@ final class Controller {
         // via SIMULATOR_HOST_HOME.
         if args.platform == .android, let store = mockStore {
             self.mockSync = MockSync(store: store, adbPath: args.adbPath, serial: args.device)
+        }
+        // USB-iPhone path: push via `xcrun devicectl device copy to`. Simulator
+        // builds skip this — they read the host file directly via SIMULATOR_HOST_HOME.
+        if args.platform == .ios, args.detached, let store = mockStore {
+            self.iosMockSync = IOSMockSync(store: store, udid: args.device)
         }
 
         // Frame store is detached-only — docked mode computes its rect from the
@@ -2662,9 +2783,7 @@ final class Controller {
         let attached: Bool
         switch args.platform {
         case .ios:
-            // iOS USB-device support lands in Phase H; until then we just stay
-            // alive as long as the user keeps the panel open.
-            attached = true
+            attached = iosDeviceAttached(udid: args.device)
         case .android:
             attached = androidDeviceAttached(serial: args.device, adbPath: args.adbPath)
         }
@@ -2676,6 +2795,51 @@ final class Controller {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
+    }
+
+    /// Returns true if `xcrun devicectl list devices --json-output` reports the
+    /// given UDID in the `connected`/`available` state. Spawns a one-shot
+    /// process every tick — devicectl is relatively expensive (~hundreds of
+    /// ms) so we accept some lag here in exchange for not maintaining a
+    /// separate USB-mux subscription.
+    private func iosDeviceAttached(udid: String) -> Bool {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sim-console-devicectl-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        proc.arguments = [
+            "devicectl", "list", "devices",
+            "--json-output", tmp.path,
+            "--quiet",
+        ]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return false
+        }
+        guard proc.terminationStatus == 0,
+              let data = try? Data(contentsOf: tmp),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = obj["result"] as? [String: Any],
+              let devices = result["devices"] as? [[String: Any]]
+        else { return false }
+        for dev in devices {
+            guard let id = dev["identifier"] as? String,
+                  let conn = dev["connectionProperties"] as? [String: Any]
+            else { continue }
+            let isMatch = udid.isEmpty || id == udid
+            if !isMatch { continue }
+            // Apple's devicectl reports tunnelState=connected when the device
+            // is plugged in and the Core Device tunnel is up. Devices we've
+            // paired with but aren't physically present are tunnelState=disconnected.
+            if let tunnelState = conn["tunnelState"] as? String,
+               tunnelState == "connected" { return true }
+        }
+        return false
     }
 
     /// Returns true if `adb -s <serial> get-state` reports "device". Faster

@@ -92,6 +92,18 @@ fi
 echo "✓ sim_logs ready at $SIM_LOGS_HOME"
 echo "  panel binary: $SIM_CONSOLE_BIN"
 echo "  android SDK:  com.simconsole:simconsole:0.1.0 (Maven Local)"
+
+# 5. (Optional but recommended) install idevicesyslog so we can stream
+#    logs from a USB-connected iPhone. Only install if Homebrew is present;
+#    fall through silently if not.
+if ! command -v idevicesyslog >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    brew install libimobiledevice 2>&1 | tail -5
+    echo "  idevicesyslog: installed via Homebrew"
+  else
+    echo "  idevicesyslog: not installed (only needed for USB iPhone support)"
+  fi
+fi
 ```
 
 If the SSH clone fails (no key configured for the user's GitHub), fall back to HTTPS:
@@ -416,7 +428,42 @@ Report back which emulator + package id were chosen so the user can sanity-check
 
 ## Section iOS-L — `launch` on iOS
 
-### L2 — Resolve the target sim
+### L2 — Resolve the target sim *or* USB device
+
+The user may want to stream from either a booted simulator or a USB-connected iPhone.
+
+**Probe for a connected iPhone first:**
+
+```bash
+# Returns a non-empty UDID if an iPhone is plugged in and paired.
+IOS_UDID=$(xcrun devicectl list devices --json-output /tmp/devicectl-devices.json --quiet 2>/dev/null \
+  && python3 -c "
+import json
+with open('/tmp/devicectl-devices.json') as f: data = json.load(f)
+for d in data.get('result', {}).get('devices', []):
+    conn = d.get('connectionProperties', {})
+    name = d.get('deviceProperties', {}).get('name', '')
+    if conn.get('tunnelState') == 'connected' and 'iPhone' in d.get('hardwareProperties', {}).get('productType', ''):
+        print(d['identifier'])
+        break
+")
+```
+
+**Disambiguate:**
+- If the user passed `realDevice` / `device` / `iphone` as an argument, prefer the iPhone.
+- If no iPhone is connected, fall back to the simulator path (sim-lock acquire, single booted sim, etc.).
+- If both are available and the user didn't specify, ask which to target.
+
+When picking the iPhone path, also resolve `idevicesyslog` (Homebrew-installed):
+
+```bash
+which idevicesyslog >/dev/null || brew install libimobiledevice
+IDEVICESYSLOG_PATH=$(which idevicesyslog)
+```
+
+Pass `--detached --device "$IOS_UDID" --idevicesyslog-path "$IDEVICESYSLOG_PATH"` to the panel. Otherwise continue with the simulator flow below.
+
+### L2 (simulator path) — Resolve the target sim
 
 If the user has acquired a sim via sim-lock for this session, use that UDID:
 
@@ -447,11 +494,31 @@ If not, tell the user to run `/runluzia` (or whatever their launch flow is) firs
 
 ### L5 — Spawn the console
 
+**For an iOS Simulator target:**
 ```bash
 "$SIM_CONSOLE_LAUNCHER" "$BUNDLE_ID" --device "$SIM_UDID" --level info
 ```
 
-Default to detached mode (the launcher's default). Pass `--foreground` only if the user explicitly asked for inline streaming.
+**For a USB-connected iPhone target:**
+```bash
+"$SIM_CONSOLE_BIN" \
+  --platform ios --detached \
+  --device "$IOS_UDID" \
+  --bundle-id "$BUNDLE_ID" \
+  --idevicesyslog-path "$IDEVICESYSLOG_PATH" \
+  --width 560 --gap 8 --side right \
+  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
+  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
+  --tab "metric|Metrics|subsystem == \"$BUNDLE_ID\" AND category == \"metric\"" \
+  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\""
+```
+
+Notes for the USB-device path:
+- `idevicesyslog` (from libimobiledevice) replaces `xcrun simctl spawn log stream` — `devicectl` doesn't have a log-stream subcommand. The panel auto-discovers it under `/opt/homebrew/bin/` or `/usr/local/bin/`.
+- `--detached` makes the panel a movable floating window (no on-screen iPhone window to dock against). Position persists at `~/.sim-console/panel-frame-<bundle>.json`.
+- Lifecycle: panel polls `xcrun devicectl list devices` once per tick — exits when the iPhone disconnects.
+- Mock sync: panel pushes mock-file changes via `xcrun devicectl device copy to --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" --source <local> --destination Documents/sim-console/mocks.json` (~hundreds of ms per push, vs near-zero on simulator).
+- **Requires iOS 17+ on the device** for the Core Device tunnel that backs `devicectl`.
 
 If a previous `sim-console` process is already running, kill it first:
 ```bash
@@ -459,7 +526,7 @@ pkill -f "sim-console --device" 2>/dev/null
 sleep 1
 ```
 
-Report back which sim + bundle id were chosen so the user can sanity-check.
+Report back which sim/device + bundle id were chosen so the user can sanity-check.
 
 ---
 

@@ -1,18 +1,26 @@
 import Foundation
 
-/// Reads mock rules from `~/.sim-console/mocks-<bundle-id>.json` and serves
-/// them to `SimConsoleURLProtocol` so matching requests get a synthesized
-/// response instead of a network call.
+/// Reads mock rules from the panel-managed JSON file and serves them to
+/// `SimConsoleURLProtocol` so matching requests get a synthesized response
+/// instead of a network call.
 ///
-/// **Simulator-only.** On a real device the singleton is inert — `findMock`
-/// always returns nil. Cross-process file access from inside an iOS app
-/// relies on the simulator's relaxed sandbox, which doesn't exist on device.
+/// Path resolution by environment:
+///   - **Simulator**: `<SIMULATOR_HOST_HOME>/.sim-console/mocks-<bundle>.json`.
+///     The simulator runtime exports `SIMULATOR_HOST_HOME` pointing at the Mac
+///     user's home, and sim builds run under that UID with a relaxed sandbox
+///     so the file is directly readable.
+///   - **Physical device**: `<NSDocumentDirectory>/sim-console/mocks.json`.
+///     The macOS panel pushes the file here via
+///     `xcrun devicectl device copy to --domain-type appDataContainer`.
+///     The panel and the SDK never share a filesystem on device, so this is
+///     the cheapest transport that doesn't need a custom over-USB protocol.
 ///
-/// Transport choice: the macOS app writes the file atomically (temp + rename).
-/// We re-read on demand based on `mtime` instead of installing a
-/// `DispatchSource` filesystem watcher — the atomic-rename pattern reliably
-/// invalidates `EVFILT_VNODE` watchers, and an `stat()` per outbound request
-/// is microseconds. Only requests that pass `canInit` ever hit the lookup.
+/// Transport choice in both cases: the file is written atomically (temp +
+/// rename or `devicectl copy`). We re-read on demand based on `mtime` rather
+/// than installing a `DispatchSource` filesystem watcher — the atomic-rename
+/// pattern reliably invalidates `EVFILT_VNODE` watchers, and a `stat()` per
+/// outbound request is microseconds. Only requests that pass `canInit` ever
+/// hit the lookup.
 public final class MockStore {
 
     public static let shared = MockStore()
@@ -28,24 +36,34 @@ public final class MockStore {
     public func configure(bundleId: String) {
         queue.async(flags: .barrier) {
             self.bundleId = bundleId
-            // Inside the iOS simulator, `NSHomeDirectory()` is the app's
-            // sandbox container — useless for cross-process file sharing
-            // with the Mac. `SIMULATOR_HOST_HOME` is the host user's home,
-            // exported by Apple's simulator runtime, and reachable from
-            // simulator-builds because they run as Mac processes under the
-            // user's UID.
-            let env = ProcessInfo.processInfo.environment
-            let home = env["SIMULATOR_HOST_HOME"] ?? NSHomeDirectory()
-            let dir = (home as NSString).appendingPathComponent(".sim-console")
-            self.path = (dir as NSString).appendingPathComponent("mocks-\(bundleId).json")
+            self.path = Self.resolvedPath(for: bundleId)
             self.cachedMocks = []
             self.cachedMTime = 0
             NSLog("[SimConsole] mocks path = \(self.path)")
         }
     }
 
-    public func findMock(for request: URLRequest) -> Mock? {
+    private static func resolvedPath(for bundleId: String) -> String {
         #if targetEnvironment(simulator)
+        let env = ProcessInfo.processInfo.environment
+        let home = env["SIMULATOR_HOST_HOME"] ?? NSHomeDirectory()
+        let dir = (home as NSString).appendingPathComponent(".sim-console")
+        return (dir as NSString).appendingPathComponent("mocks-\(bundleId).json")
+        #else
+        // App sandbox Documents dir — the only writable location reachable
+        // from `devicectl copy to` with `--domain-type appDataContainer`.
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+            ?? NSHomeDirectory()
+        let dir = (docs as NSString).appendingPathComponent("sim-console")
+        return (dir as NSString).appendingPathComponent("mocks.json")
+        #endif
+    }
+
+    public func findMock(for request: URLRequest) -> Mock? {
+        // Mocking is active on both simulator and physical-device builds now.
+        // Apps that link the package but skip `bootstrap` keep paying zero —
+        // path is empty until configure() runs, so reloadIfChangedLocked returns
+        // immediately with no mocks loaded.
         return queue.sync {
             reloadIfChangedLocked()
             for mock in cachedMocks where mock.enabled {
@@ -55,9 +73,6 @@ public final class MockStore {
             }
             return nil
         }
-        #else
-        return nil
-        #endif
     }
 
     /// Public so tests can drive a forced reload from a known path.

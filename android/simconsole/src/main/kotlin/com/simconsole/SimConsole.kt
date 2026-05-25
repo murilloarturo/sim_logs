@@ -47,27 +47,59 @@ object SimConsole {
     @Volatile private var configuration: Configuration? = null
     @Volatile internal var sink: Sink = LogcatSink
 
+    private var metricSampler: MetricSampler? = null
+    private var fpsSampler: FpsSampler? = null
+    private var hangDetector: HangDetector? = null
+
     /** True iff [bootstrap] has been called with `enabled = true`. */
     val isEnabled: Boolean get() = configuration?.enabled == true
 
     internal val maxBodyChars: Int get() = configuration?.maxBodyChars ?: 800
 
     /**
-     * Wire the SDK. Idempotent — repeated calls overwrite the config. The `context`
-     * arg is reserved for future phases (mock-file path resolution, ContentResolver
-     * lookups) and not currently used.
+     * Wire the SDK. Idempotent — repeated calls overwrite the config. The
+     * `context.applicationContext` is retained for the lifetime of the process
+     * so background samplers can query system services without leaking an
+     * Activity reference.
      */
     @JvmStatic
     @JvmOverloads
     fun bootstrap(context: Context, subsystem: String, enabled: Boolean = true, maxBodyChars: Int = 800) {
-        bootstrap(Configuration(subsystem = subsystem, enabled = enabled, maxBodyChars = maxBodyChars))
+        bootstrap(
+            config = Configuration(subsystem = subsystem, enabled = enabled, maxBodyChars = maxBodyChars),
+            appContext = context.applicationContext,
+        )
     }
 
     @JvmStatic
     fun bootstrap(config: Configuration) {
+        bootstrap(config = config, appContext = null)
+    }
+
+    private fun bootstrap(config: Configuration, appContext: Context?) {
         synchronized(lock) {
             configuration = config
+            // Anchor launch timing immediately so milestones report from the
+            // SDK-load moment if the host never calls Metric.appStartLaunch().
+            Metric.processStart
+            if (!config.enabled) {
+                stopSamplersLocked()
+                return
+            }
+            // Idempotent: don't stack samplers if bootstrap is called again.
+            stopSamplersLocked()
+            if (appContext != null) {
+                metricSampler = MetricSampler(appContext).also { it.start() }
+            }
+            fpsSampler = FpsSampler().also { it.start() }
+            hangDetector = HangDetector().also { it.start() }
         }
+    }
+
+    private fun stopSamplersLocked() {
+        metricSampler?.stop(); metricSampler = null
+        fpsSampler?.stop(); fpsSampler = null
+        hangDetector?.stop(); hangDetector = null
     }
 
     // ---------------------------------------------------------------------
@@ -232,6 +264,11 @@ object SimConsole {
     // ---------------------------------------------------------------------
     // Internal emission path
     // ---------------------------------------------------------------------
+
+    /** Used by [Metric] (separate file, same package). Pinned to `Level.Info`. */
+    internal fun emitMetric(payload: Map<String, Any?>) {
+        emit("SimConsole.metric", Level.Info, payload)
+    }
 
     private fun emit(tag: String, level: Level, payload: Map<String, Any?>) {
         val json = Envelope.encode(payload)

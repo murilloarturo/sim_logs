@@ -1,5 +1,6 @@
 # sim_logs build artifacts
 Tools/sim-console
+Tools/SimConsole.app/
 
 # XcodeGen regenerates the demo project — committed users run `xcodegen generate`
 Examples/DemoApp/DemoApp.xcodeproj/

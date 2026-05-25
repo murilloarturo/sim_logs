@@ -1222,6 +1222,14 @@ struct RootView: View {
 final class ConsoleState: ObservableObject {
     @Published var tabs: [TabViewModel]
     @Published var activeIndex: Int = 0
+    /// When `true`, the panel snaps to and follows the sim/emulator window
+    /// every tick. When `false`, the user can move and resize the window
+    /// freely (and we persist its frame). Set false by the Controller for
+    /// USB-device launches where there's no on-screen window to dock to.
+    @Published var attached: Bool = true
+    /// Disables the attach toggle UI when there's no sim/emulator window
+    /// available (e.g., physical USB device, or platform doesn't support docking).
+    @Published var attachAvailable: Bool = true
     let appLabel: String
     let accent: Color
     let mockStore: MockStore?
@@ -1248,14 +1256,48 @@ final class ConsoleState: ObservableObject {
 struct HeaderBar: View {
     @ObservedObject var state: ConsoleState
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text(state.appLabel)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.black)
-                .padding(.horizontal, 10)
+                .padding(.leading, 10)
+            Spacer()
+            AttachToggle(state: state)
+                .padding(.trailing, 8)
         }
         .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
         .background(state.accent)
+    }
+}
+
+/// One-button attach/detach toggle. Shows in the header bar.
+/// - When `attachAvailable` is false (USB device, etc.), the button is hidden
+///   since there's no sim/emulator window to dock to.
+/// - When attached, label reads "Detach" — clicking it stops tracking and
+///   lets the user move/resize freely.
+/// - When detached, label reads "Attach" — clicking it re-docks to the sim.
+struct AttachToggle: View {
+    @ObservedObject var state: ConsoleState
+    var body: some View {
+        if state.attachAvailable {
+            Button(action: { state.attached.toggle() }) {
+                HStack(spacing: 4) {
+                    Image(systemName: state.attached ? "pin.slash.fill" : "pin.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(state.attached ? "Detach" : "Attach")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .foregroundColor(.black)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.black.opacity(0.10))
+                .cornerRadius(4)
+            }
+            .buttonStyle(.plain)
+            .help(state.attached
+                ? "Currently tracking the sim/emulator window. Click to free the panel."
+                : "Currently freestanding. Click to snap back beside the sim/emulator window.")
+        }
     }
 }
 
@@ -2612,11 +2654,15 @@ struct MockEditorView: View {
 }
 
 // ---------------------------------------------------------------------------
-// MARK: - Borderless keyable panel
+// MARK: - Keyable panel
 
+/// The panel uses [.titled, .closable, .miniaturizable, .resizable] now that
+/// SimConsole ships as a real `.app` bundle. We still let it become key so
+/// the search field can accept focus, and become main so it shows up in
+/// `Cmd+Tab` / Dock context menu like a normal app window.
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { true }
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,29 +2709,34 @@ final class Controller {
             ? PanelFrameStore(bundleId: args.bundleId)
             : nil
 
-        // Detached mode gets a movable borderless panel: same visual style as
-        // docked mode (no chrome) but the user can drag it from anywhere on
-        // the surface. Docked mode stays non-movable because the position is
-        // computed every tick from the sim/emulator's window frame.
+        // Now that SimConsole is a real .app bundle, the panel is a normal
+        // titled / resizable / closable window. Attach/Detach state controls
+        // *whether* it tracks the sim/emulator window (set on .level + the
+        // re-dock logic in tick()), not the window chrome.
         let savedFrame = frameStore?.load()
         let initialFrame = savedFrame ?? NSRect(x: 100, y: 100, width: args.width, height: 700)
 
         let panel = KeyablePanel(
             contentRect: initialFrame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
+        panel.title = args.appLabel.isEmpty ? "SimConsole" : "SimConsole — \(args.appLabel)"
         panel.isOpaque = true
         panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         panel.hasShadow = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        panel.isMovable = args.detached
-        panel.isMovableByWindowBackground = args.detached
-        panel.hidesOnDeactivate = false
-        panel.isFloatingPanel = true
-        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.fullScreenAuxiliary]
+        panel.minSize = NSSize(width: 360, height: 320)
+        panel.isReleasedWhenClosed = false
+        // Default to a sim/emulator-tracking window (attached mode) when we
+        // expect to find an on-screen device. USB-device launches start in
+        // freestanding mode AND hide the attach toggle, since there's no
+        // device window on the Mac to snap against.
+        let attachedInitially = !args.detached
+        state.attached = attachedInitially
+        state.attachAvailable = !args.detached
+        panel.level = attachedInitially ? .floating : .normal
 
         let hosting = NSHostingView(rootView: RootView(state: state))
         hosting.frame = NSRect(origin: .zero, size: panel.frame.size)
@@ -2694,15 +2745,26 @@ final class Controller {
 
         self.panel = panel
 
-        // Persist the panel position when the user finishes dragging. Only
-        // wire the observer in detached mode — docked mode rewrites the frame
-        // every tick, so any "move" notification would just be us re-docking.
-        if args.detached, let store = frameStore {
-            frameObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didMoveNotification,
-                object: panel,
-                queue: .main,
-            ) { _ in
+        // When the user closes the window, treat it as quitting the app —
+        // there's no other window to keep us alive.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main,
+        ) { _ in
+            NSApp.terminate(nil)
+        }
+
+        // Persist the panel position whenever the user drags it. We only react
+        // when state.attached is false — attached mode rewrites the frame
+        // every tick, so didMove notifications are us, not the user.
+        frameObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: panel,
+            queue: .main,
+        ) { [weak self] _ in
+            guard let self else { return }
+            if !self.state.attached, let store = self.frameStore {
                 store.save(panel.frame)
             }
         }
@@ -2717,9 +2779,9 @@ final class Controller {
     }
 
     private func tick() {
-        // Detached mode runs against a USB-connected device or any target
-        // without an on-screen window. Lifecycle is "device still online?",
-        // not "is the sim/emulator GUI alive?".
+        // USB-device targets (Android USB or iOS USB) have no on-screen
+        // device window. attachAvailable was already set false at startup;
+        // we just need the device-lifecycle probe.
         if args.detached {
             tickDetached(); return
         }
@@ -2744,6 +2806,27 @@ final class Controller {
             for tab in state.tabs { tab.stop() }
             exit(0)
         }
+
+        // Toggle the attach-button visibility based on whether we can locate
+        // a window to dock to right now (sim may have moved off-screen, etc.).
+        let canAttach = axRect != nil
+        if state.attachAvailable != canAttach {
+            state.attachAvailable = canAttach
+        }
+
+        // Detached *via the UI toggle*: leave the user's frame alone. Window
+        // stays visible — we just don't re-dock.
+        if !state.attached {
+            // Window level should be .normal so it behaves like a regular
+            // app window the user can put behind other things.
+            if panel.level != .normal { panel.level = .normal }
+            if !panel.isVisible { panel.orderFrontRegardless() }
+            return
+        }
+
+        // Attached: snap beside the sim/emulator window. Level=.floating so
+        // it stays above the device window even if focus shifts elsewhere.
+        if panel.level != .floating { panel.level = .floating }
         guard let axRect else {
             panel.orderOut(nil); return
         }
@@ -2889,9 +2972,13 @@ guard !args.tabs.isEmpty else {
 _ = nudgeAXPrompt()
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+// .regular = standard macOS app: shows in Dock, owns a menu bar, indexable
+// by Spotlight. We used to run as .accessory (no Dock icon) for the
+// borderless-overlay era; now SimConsole is a real .app bundle.
+app.setActivationPolicy(.regular)
 
 let controller = Controller(args: args)
 controller.start()
 
+app.activate(ignoringOtherApps: true)
 app.run()

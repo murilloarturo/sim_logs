@@ -27,12 +27,14 @@ If the argument matches no known sub-command and doesn't look like a bundle id (
 
 ```bash
 SIM_LOGS_HOME="${SIM_LOGS_HOME:-$HOME/Developer/sim_logs}"
-SIM_CONSOLE_BIN="$SIM_LOGS_HOME/Tools/sim-console"
+SIM_CONSOLE_APP="$SIM_LOGS_HOME/Tools/SimConsole.app"
 SIM_CONSOLE_LAUNCHER="$SIM_LOGS_HOME/Tools/sim-console.sh"
 SIM_LOGS_REPO="git@github.com:murilloarturo/sim_logs.git"
 ```
 
 `SIM_LOGS_HOME` is overridable so multiple machines / multiple checkouts can coexist. Default lives under `~/Developer/sim_logs/`.
+
+**Note:** SimConsole now ships as a real `.app` bundle (since the USB-device phase). Launch it with `open -n -a "$SIM_CONSOLE_APP" --args …` instead of running a bare binary. `-n` forces a fresh instance so concurrent launches with different `--device` targets don't collide.
 
 ---
 
@@ -75,8 +77,9 @@ if [ -z "$(git status --porcelain)" ] && [ "$(git symbolic-ref --short HEAD)" = 
   git pull --ff-only || true
 fi
 
-# 3. Build the macOS binary if missing or stale
-if [ ! -x "$SIM_CONSOLE_BIN" ] || [ "$SIM_LOGS_HOME/Tools/sim-console.swift" -nt "$SIM_CONSOLE_BIN" ]; then
+# 3. Build the SimConsole.app bundle if missing or stale
+APP_EXE="$SIM_CONSOLE_APP/Contents/MacOS/SimConsole"
+if [ ! -x "$APP_EXE" ] || [ "$SIM_LOGS_HOME/Tools/sim-console.swift" -nt "$APP_EXE" ]; then
   "$SIM_LOGS_HOME/Tools/build.sh"
 fi
 
@@ -90,7 +93,7 @@ if [ ! -f "$M2_AAR" ] || [ -n "$NEWEST_SRC" ]; then
 fi
 
 echo "✓ sim_logs ready at $SIM_LOGS_HOME"
-echo "  panel binary: $SIM_CONSOLE_BIN"
+echo "  panel app:    $SIM_CONSOLE_APP"
 echo "  android SDK:  com.simconsole:simconsole:0.1.0 (Maven Local)"
 
 # 5. (Optional but recommended) install idevicesyslog so we can stream
@@ -395,7 +398,7 @@ If not, tell the user to `./gradlew :app:installDebug` (or run via Android Studi
 ### A-L5 — Spawn the panel
 
 ```bash
-"$SIM_CONSOLE_BIN" \
+open -n -a "$SIM_CONSOLE_APP" --args \
   --platform android \
   --device "$SERIAL" \
   --tag "Android Emulator" \
@@ -461,7 +464,33 @@ which idevicesyslog >/dev/null || brew install libimobiledevice
 IDEVICESYSLOG_PATH=$(which idevicesyslog)
 ```
 
-Pass `--detached --device "$IOS_UDID" --idevicesyslog-path "$IDEVICESYSLOG_PATH"` to the panel. Otherwise continue with the simulator flow below.
+### L2.5 (USB device path only) — Install the iOS app on the phone before opening SimConsole
+
+Cold-flow for a connected iPhone is: **build → install on device → open SimConsole pointing at it**. The user shouldn't have to fall back to Xcode just to side-load the app.
+
+Detect the host project's preferred device-install path in this order:
+
+1. **Project-specific skill** — if the current repo has `/runluzia realDevice` (or any project-defined "run on physical device" command), delegate to it. Cleanest path because the project owns its scheme + signing config.
+
+2. **`xcodebuild` build for device + `xcrun devicectl device install`** — generic fallback. Run from the repo root:
+   ```bash
+   xcodebuild -workspace <ws>.xcworkspace -scheme <scheme> \
+     -configuration Debug \
+     -destination "platform=iOS,id=$IOS_UDID" \
+     -derivedDataPath /tmp/sim-logs-derived \
+     build 2>&1 | tail -5
+
+   APP_PATH=$(find /tmp/sim-logs-derived/Build/Products/Debug-iphoneos -maxdepth 1 -name "*.app" -type d | head -1)
+   xcrun devicectl device install app --device "$IOS_UDID" "$APP_PATH"
+   ```
+
+3. **Manual**: if neither works, tell the user "I couldn't auto-install — install the app via Xcode first, then re-run `/sim-console launch`."
+
+After install succeeds, the iOS app needs to be running for events to flow. Either:
+- Let the user tap the app on the phone, or
+- `xcrun devicectl device process launch --device "$IOS_UDID" --terminate-existing "$BUNDLE_ID"`
+
+Then continue to step L5 (USB-device variant) to open SimConsole. Otherwise — for a simulator target — continue with the simulator flow below.
 
 ### L2 (simulator path) — Resolve the target sim
 
@@ -496,12 +525,23 @@ If not, tell the user to run `/runluzia` (or whatever their launch flow is) firs
 
 **For an iOS Simulator target:**
 ```bash
-"$SIM_CONSOLE_LAUNCHER" "$BUNDLE_ID" --device "$SIM_UDID" --level info
+open -n -a "$SIM_CONSOLE_APP" --args \
+  --platform ios \
+  --device "$SIM_UDID" \
+  --tag "$SIM_NAME" \
+  --bundle-id "$BUNDLE_ID" \
+  --width 560 --gap 8 --side right --level info \
+  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
+  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
+  --tab "metric|Metrics|subsystem == \"$BUNDLE_ID\" AND category == \"metric\"" \
+  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\""
 ```
+
+The simulator path opens *attached* — the panel snaps next to the Simulator window via Accessibility-API lookup and tracks it. Click the **Detach** button in the header to free the panel; click **Attach** to snap it back.
 
 **For a USB-connected iPhone target:**
 ```bash
-"$SIM_CONSOLE_BIN" \
+open -n -a "$SIM_CONSOLE_APP" --args \
   --platform ios --detached \
   --device "$IOS_UDID" \
   --bundle-id "$BUNDLE_ID" \

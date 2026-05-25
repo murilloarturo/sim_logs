@@ -343,19 +343,28 @@ Call the `install` sub-command logic first (idempotent — fast no-op if already
 
 ## Section ANDROID-L — `launch` on Android
 
-### A-L2 — Resolve the target emulator
+### A-L2 — Resolve the target device (emulator or USB)
 
 ```bash
-# Pick the first booted emulator. If multiple, prefer one tagged in adb output.
-SERIAL=$(adb devices | awk '/emulator-[0-9]+\s+device/ { print $1; exit }')
+# Pick the first attached emulator OR USB device.
+# Format: "<serial>\tdevice" — emulators have "emulator-NNNN", USB phones have a hex serial.
+SERIAL=$(adb devices | awk '/\tdevice$/ { print $1; exit }')
 if [ -z "$SERIAL" ]; then
-  echo "No Android emulator booted. Start one in Android Studio or with"
+  echo "No Android device or emulator attached. Start an emulator with"
   echo "  emulator -avd <name>"
+  echo "or plug in a phone with USB debugging enabled."
   exit 1
+fi
+
+# Detached mode is required for USB devices (no on-screen device window to dock to).
+if [[ "$SERIAL" == emulator-* ]]; then
+  DETACHED_FLAG=""
+else
+  DETACHED_FLAG="--detached"
 fi
 ```
 
-If multiple emulators are booted, ask the user which one — we don't have an Android equivalent of `sim-lock` yet.
+If multiple devices are attached, ask the user which one — we don't have an Android equivalent of `sim-lock` yet. Tell the user whether you picked an emulator (docked panel) or USB device (detached panel) so they can sanity-check.
 
 ### A-L3 — Resolve the package id
 
@@ -380,6 +389,7 @@ If not, tell the user to `./gradlew :app:installDebug` (or run via Android Studi
   --tag "Android Emulator" \
   --bundle-id "$APPLICATION_ID" \
   --width 560 --gap 8 --side right \
+  $DETACHED_FLAG \
   --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
   --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
   --tab "metric|Metrics|SimConsole.metric:V SimConsole.metric.chunk:V *:S" \
@@ -389,9 +399,10 @@ If not, tell the user to `./gradlew :app:installDebug` (or run via Android Studi
 ```
 
 Notes:
-- The `--tag "Android Emulator"` argument is accepted for symmetry with the iOS path but unused on Android — the panel docks against the qemu window via `CGWindowListCopyWindowInfo` regardless of title.
+- The `--tag "Android Emulator"` argument is accepted for symmetry with the iOS path but unused on Android — the panel docks against the qemu window via `CGWindowListCopyWindowInfo` (emulators) or floats freely (USB devices, via `--detached`).
 - Each `--tab` for Android takes a **logcat filterspec** as the third pipe-separated field (not an NSPredicate). The `*:S` suffix silences everything else; omit it for the All/Errors tabs which want to see other tags.
 - `--bundle-id` enables MockSync — the panel will `adb push` `~/.sim-console/mocks-<pkg>.json` to `/data/local/tmp/` on every mock edit.
+- `--detached` (auto-appended for USB devices) makes the panel a user-draggable floating window. Position persists at `~/.sim-console/panel-frame-<pkg>.json` across runs. Lifecycle switches to `adb -s <serial> get-state` polling — panel exits when the device disconnects.
 
 Kill any previous panel first:
 ```bash

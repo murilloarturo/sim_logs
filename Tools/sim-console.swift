@@ -61,6 +61,10 @@ struct Args {
     var bundleId: String = ""
     /// Path to the `adb` binary. Discovered at startup when empty.
     var adbPath: String = ""
+    /// When true, the panel is a user-positionable floating window rather
+    /// than a borderless overlay that tracks the sim/emulator. Required for
+    /// USB-connected physical devices (no on-screen device window to dock to).
+    var detached: Bool = false
 }
 
 func parseColor(_ hex: String) -> Color? {
@@ -108,6 +112,7 @@ func parseArgs() -> Args {
             if let p = Platform(rawValue: argv[i+1]) { a.platform = p }
             i += 2
         case "--adb-path":  a.adbPath = argv[i+1]; i += 2
+        case "--detached":  a.detached = true; i += 1
         default: i += 1
         }
     }
@@ -253,6 +258,43 @@ func findEmulatorWindowFrame(matching tag: String = "") -> CGRect? {
 
 /// Mirrors `simulatorAppRunning()`. CGWindowList sees qemu's windows even
 /// though it has no app bundle, so we just check whether any survive.
+/// Persists the panel's last on-screen frame so the user doesn't have to
+/// re-position the detached panel every launch. Stored at
+/// `~/.sim-console/panel-frame-<bundleId>.json`. Falls back to a sensible
+/// default rect (right-of-primary-screen) when no saved state exists.
+final class PanelFrameStore {
+    private let path: String
+
+    init(bundleId: String) {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".sim-console")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // Sanitize bundle id for filesystem use (dots are fine, but be paranoid).
+        let safe = bundleId.replacingOccurrences(of: "/", with: "_")
+        self.path = (dir as NSString).appendingPathComponent("panel-frame-\(safe).json")
+    }
+
+    func load() -> NSRect? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Double],
+              let x = obj["x"], let y = obj["y"],
+              let w = obj["width"], let h = obj["height"],
+              w > 100, h > 100
+        else { return nil }
+        return NSRect(x: x, y: y, width: w, height: h)
+    }
+
+    func save(_ rect: NSRect) {
+        let obj: [String: Double] = [
+            "x": Double(rect.minX),
+            "y": Double(rect.minY),
+            "width": Double(rect.width),
+            "height": Double(rect.height),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
+        try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
+    }
+}
+
 func emulatorAppRunning() -> Bool {
     let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
     for w in list {
@@ -2473,6 +2515,8 @@ final class Controller {
     var lastFrame: NSRect = .zero
     var refreshTimer: Timer?
     var mockSync: MockSync?
+    let frameStore: PanelFrameStore?
+    private var frameObserver: NSObjectProtocol?
 
     init(args: Args) {
         self.args = args
@@ -2492,8 +2536,21 @@ final class Controller {
             self.mockSync = MockSync(store: store, adbPath: args.adbPath, serial: args.device)
         }
 
+        // Frame store is detached-only — docked mode computes its rect from the
+        // sim/emulator's window every tick and ignores saved frames.
+        self.frameStore = args.detached && !args.bundleId.isEmpty
+            ? PanelFrameStore(bundleId: args.bundleId)
+            : nil
+
+        // Detached mode gets a movable borderless panel: same visual style as
+        // docked mode (no chrome) but the user can drag it from anywhere on
+        // the surface. Docked mode stays non-movable because the position is
+        // computed every tick from the sim/emulator's window frame.
+        let savedFrame = frameStore?.load()
+        let initialFrame = savedFrame ?? NSRect(x: 100, y: 100, width: args.width, height: 700)
+
         let panel = KeyablePanel(
-            contentRect: NSRect(x: 0, y: 0, width: args.width, height: 700),
+            contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -2503,7 +2560,8 @@ final class Controller {
         panel.hasShadow = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        panel.isMovable = false
+        panel.isMovable = args.detached
+        panel.isMovableByWindowBackground = args.detached
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
@@ -2514,6 +2572,19 @@ final class Controller {
         panel.contentView = hosting
 
         self.panel = panel
+
+        // Persist the panel position when the user finishes dragging. Only
+        // wire the observer in detached mode — docked mode rewrites the frame
+        // every tick, so any "move" notification would just be us re-docking.
+        if args.detached, let store = frameStore {
+            frameObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMoveNotification,
+                object: panel,
+                queue: .main,
+            ) { _ in
+                store.save(panel.frame)
+            }
+        }
     }
 
     func start() {
@@ -2525,6 +2596,13 @@ final class Controller {
     }
 
     private func tick() {
+        // Detached mode runs against a USB-connected device or any target
+        // without an on-screen window. Lifecycle is "device still online?",
+        // not "is the sim/emulator GUI alive?".
+        if args.detached {
+            tickDetached(); return
+        }
+
         let hostRunning: Bool
         let axRect: CGRect?
         switch args.platform {
@@ -2576,6 +2654,55 @@ final class Controller {
             panel.orderFrontRegardless()
         }
     }
+
+    /// Detached-mode tick: don't recompute the panel frame (the user controls
+    /// it), and use the platform's "is the target still attached?" probe
+    /// instead of looking for a sim/emulator window.
+    private func tickDetached() {
+        let attached: Bool
+        switch args.platform {
+        case .ios:
+            // iOS USB-device support lands in Phase H; until then we just stay
+            // alive as long as the user keeps the panel open.
+            attached = true
+        case .android:
+            attached = androidDeviceAttached(serial: args.device, adbPath: args.adbPath)
+        }
+        if !attached {
+            diag("detached target (\(args.platform.rawValue) \(args.device)) disconnected; exiting")
+            for tab in state.tabs { tab.stop() }
+            exit(0)
+        }
+        if !panel.isVisible {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    /// Returns true if `adb -s <serial> get-state` reports "device". Faster
+    /// than parsing `adb devices` and doesn't race when multiple emulators
+    /// boot/quit around the same time.
+    private func androidDeviceAttached(serial: String, adbPath: String) -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: adbPath.hasPrefix("/") ? adbPath : "/usr/bin/env")
+        var argv: [String] = []
+        if !adbPath.hasPrefix("/") { argv.append(adbPath) }
+        if !serial.isEmpty { argv.append(contentsOf: ["-s", serial]) }
+        argv.append("get-state")
+        proc.arguments = argv
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return false
+        }
+        guard proc.terminationStatus == 0,
+              let data = try? pipe.fileHandleForReading.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines) == "device"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2586,8 +2713,8 @@ guard !args.device.isEmpty else {
     FileHandle.standardError.write(Data("sim-console: --device required\n".utf8))
     exit(2)
 }
-guard !args.tag.isEmpty else {
-    FileHandle.standardError.write(Data("sim-console: --tag required\n".utf8))
+guard !args.tag.isEmpty || args.detached else {
+    FileHandle.standardError.write(Data("sim-console: --tag required (or pass --detached for USB devices)\n".utf8))
     exit(2)
 }
 guard !args.tabs.isEmpty else {

@@ -82,6 +82,9 @@ object SimConsole {
             // Anchor launch timing immediately so milestones report from the
             // SDK-load moment if the host never calls Metric.appStartLaunch().
             Metric.processStart
+            // Wire mocks regardless of enable state — disabling SimConsole
+            // shouldn't leave a previously-loaded mock file silently in effect.
+            MockStore.configure(config.subsystem)
             if (!config.enabled) {
                 stopSamplersLocked()
                 return

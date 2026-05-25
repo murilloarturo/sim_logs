@@ -167,6 +167,61 @@ class SimConsoleInterceptorTest {
     }
 
     @Test
+    fun matchedMockShortCircuitsTheNetwork() {
+        // Bind a temp mocks file.
+        val tmp = java.io.File.createTempFile("mocks-", ".json")
+        tmp.writeText(
+            """{"version":1,"mocks":[
+              {"id":"m1","match":{"method":"GET","url":"https://mocked.invalid/x"},
+               "response":{"status":418,"headers":{"X-Brewed-By":"sim-console"},"body":"I'm a teapot"},
+               "delay_ms":0,"enabled":true,"created_at":""}
+            ]}""".trimIndent(),
+        )
+        MockStore.reloadFromPath(tmp.absolutePath)
+
+        val response = client.newCall(
+            okhttp3.Request.Builder().url("https://mocked.invalid/x").build(),
+        ).execute()
+        response.use {
+            assertEquals(418, it.code)
+            assertEquals("sim-console", it.header("X-Brewed-By"))
+            assertEquals("I'm a teapot", it.body!!.string())
+        }
+
+        // Both request and response envelopes should carry mocked=true.
+        val req = envelopes("net.request").single()
+        val resp = envelopes("net.response").single()
+        assertTrue("request should be marked mocked", req.optBoolean("mocked"))
+        assertTrue("response should be marked mocked", resp.optBoolean("mocked"))
+        assertEquals(req.getString("id"), resp.getString("id"))
+
+        // Sanity: server-side enqueueing wasn't consumed. (If the interceptor
+        // had let it through, MockWebServer would have surfaced an unexpected
+        // request error on the response below.)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun mockDelayIsHonored() {
+        val tmp = java.io.File.createTempFile("mocks-", ".json")
+        tmp.writeText(
+            """{"version":1,"mocks":[
+              {"id":"m1","match":{"method":"GET","url":"https://slow.invalid/x"},
+               "response":{"status":200,"headers":{},"body":"hi"},
+               "delay_ms":120,"enabled":true,"created_at":""}
+            ]}""".trimIndent(),
+        )
+        MockStore.reloadFromPath(tmp.absolutePath)
+
+        val start = System.currentTimeMillis()
+        client.newCall(
+            okhttp3.Request.Builder().url("https://slow.invalid/x").build(),
+        ).execute().close()
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue("expected >=120 ms elapsed, got $elapsed", elapsed >= 120)
+    }
+
+    @Test
     fun bodyIsClippedAtMaxBodyChars() {
         SimConsole.bootstrap(
             SimConsole.Configuration(subsystem = "com.example.test", enabled = true, maxBodyChars = 16),

@@ -2131,6 +2131,67 @@ struct MockFile: Codable {
     var mocks: [Mock]
 }
 
+/// Pushes the panel-managed mock file from `~/.sim-console/mocks-<pkg>.json`
+/// to the Android device/emulator's `/data/local/tmp/sim-console-mocks-<pkg>.json`
+/// every time the panel re-writes it. The SDK's `MockStore` watches the
+/// destination via `mtime` polling and reloads.
+///
+/// We chose `/data/local/tmp` because (a) `adb push` can write there without
+/// root, (b) it's world-readable so the app sandbox can `File.readText()` it,
+/// and (c) it survives across debug reinstalls (unlike `app.cacheDir`).
+final class MockSync {
+    private let adbPath: String
+    private let serial: String
+    private let bundleId: String
+    private let localPath: String
+    private let queue = DispatchQueue(label: "sim-console.mock-sync", qos: .utility)
+    private var cancellable: Any?  // AnyCancellable; storing as Any avoids the import dance
+
+    init(store: MockStore, adbPath: String, serial: String) {
+        self.adbPath = adbPath
+        self.serial = serial
+        self.bundleId = store.bundleId
+        self.localPath = store.path
+
+        // Push once on startup so the device picks up whatever the panel
+        // already had on disk before we attached.
+        pushNow()
+
+        // Subscribe to mock-set changes. Debounce-ish: we only schedule one
+        // push per change tick — duplicate fast edits collapse.
+        self.cancellable = store.$mocks
+            .receive(on: queue)
+            .sink { [weak self] _ in self?.pushNow() }
+    }
+
+    private var devicePath: String { "/data/local/tmp/sim-console-mocks-\(bundleId).json" }
+
+    private func pushNow() {
+        guard FileManager.default.fileExists(atPath: localPath) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: adbPath.hasPrefix("/") ? adbPath : "/usr/bin/env")
+        var argv: [String] = []
+        if !adbPath.hasPrefix("/") { argv.append(adbPath) }
+        if !serial.isEmpty { argv.append(contentsOf: ["-s", serial]) }
+        argv.append(contentsOf: ["push", localPath, devicePath])
+        proc.arguments = argv
+        // Discard adb's "<N> KB/s (X bytes in Ys)" output — we only care about
+        // success/failure. Errors land in our diag log.
+        let nullPipe = Pipe()
+        proc.standardOutput = nullPipe
+        proc.standardError = nullPipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus != 0 {
+                diag("MockSync: adb push failed (exit \(proc.terminationStatus)) for \(devicePath)")
+            }
+        } catch {
+            diag("MockSync: adb push spawn failed: \(error)")
+        }
+    }
+}
+
 final class MockStore: ObservableObject {
     @Published private(set) var mocks: [Mock] = []
     let bundleId: String
@@ -2411,6 +2472,7 @@ final class Controller {
     let exporter: Exporter?
     var lastFrame: NSRect = .zero
     var refreshTimer: Timer?
+    var mockSync: MockSync?
 
     init(args: Args) {
         self.args = args
@@ -2421,6 +2483,14 @@ final class Controller {
         let mockStore: MockStore? = args.bundleId.isEmpty ? nil : MockStore(bundleId: args.bundleId)
         let state = ConsoleState(tabs: tabs, appLabel: appLabel, accent: args.accent, mockStore: mockStore)
         self.state = state
+
+        // Cross-process mock sync: panel writes ~/.sim-console/mocks-<pkg>.json
+        // on the host; we `adb push` to /data/local/tmp/ where the SDK reads it.
+        // iOS doesn't need this — the simulator can read the host file directly
+        // via SIMULATOR_HOST_HOME.
+        if args.platform == .android, let store = mockStore {
+            self.mockSync = MockSync(store: store, adbPath: args.adbPath, serial: args.device)
+        }
 
         let panel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: args.width, height: 700),

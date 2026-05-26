@@ -47,10 +47,42 @@ test('analytics() before bootstrap queues, flushes on bootstrap', async () => {
   await new Promise((r) => setImmediate(r));
 
   const events = sentRequests.map((r) => JSON.parse(r.init.body));
-  // Bootstrap also emits a metric.launch.start, so 2 events expected.
-  assert.equal(events.length, 2);
+  // Bootstrap also emits session.register and metric.launch.start, plus
+  // the queued analytics.event flushes — 3 events expected.
+  assert.equal(events.length, 3);
   const kinds = events.map((e) => e.kind).sort();
-  assert.deepEqual(kinds, ['analytics.event', 'metric.launch.start']);
+  assert.deepEqual(kinds, ['analytics.event', 'metric.launch.start', 'session.register']);
+});
+
+test('bootstrap emits a session.register with origin/title/user_agent', async () => {
+  // Pretend the page is at a known location/title. Node's `navigator` is a
+  // getter-only global, so we use Object.defineProperty to override it.
+  globalThis.location = { origin: 'https://test.example', pathname: '/foo' };
+  globalThis.document = { title: 'Test Page' };
+  const navDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { userAgent: 'TestAgent/1.0' },
+    configurable: true,
+    writable: true,
+  });
+
+  SimConsole.bootstrap({ subsystem: 'test.app' });
+  await new Promise((r) => setImmediate(r));
+
+  const session = sentRequests
+    .map((r) => JSON.parse(r.init.body))
+    .find((e) => e.kind === 'session.register');
+  assert.ok(session, 'session.register should be emitted');
+  assert.equal(session.subsystem, 'test.app');
+  assert.equal(session.origin, 'https://test.example');
+  assert.equal(session.pathname, '/foo');
+  assert.equal(session.title, 'Test Page');
+  assert.equal(session.user_agent, 'TestAgent/1.0');
+
+  // Restore globals so subsequent tests aren't poisoned.
+  delete globalThis.location;
+  delete globalThis.document;
+  if (navDescriptor) Object.defineProperty(globalThis, 'navigator', navDescriptor);
 });
 
 test('bootstrap installs fetch wrapper that captures user requests', async () => {

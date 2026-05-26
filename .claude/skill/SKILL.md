@@ -30,6 +30,11 @@ SIM_LOGS_HOME="${SIM_LOGS_HOME:-$HOME/Developer/sim_logs}"
 SIM_CONSOLE_APP="$SIM_LOGS_HOME/Tools/SimConsole.app"
 SIM_CONSOLE_LAUNCHER="$SIM_LOGS_HOME/Tools/sim-console.sh"
 SIM_LOGS_REPO="git@github.com:murilloarturo/sim_logs.git"
+# Web bridge — local-only HTTP server that ferries browser events into
+# the panel. Distributed as a Node ESM file in the same repo for now;
+# Phase W-F will publish it to npm so users can `npx @simconsole/bridge`.
+SIM_CONSOLE_BRIDGE="$SIM_LOGS_HOME/web/bridge/bin/simconsole-bridge.mjs"
+SIM_CONSOLE_WEB_SDK="$SIM_LOGS_HOME/web/sdk"
 ```
 
 `SIM_LOGS_HOME` is overridable so multiple machines / multiple checkouts can coexist. Default lives under `~/Developer/sim_logs/`.
@@ -48,13 +53,23 @@ IOS_MARKERS=( "project.yml" "Package.swift" "*.xcodeproj" "*.xcworkspace" )
 # Android markers (must have both gradle settings + an app module)
 ANDROID_SETTINGS=( "settings.gradle.kts" "settings.gradle" )
 ANDROID_BUILDS=(   "app/build.gradle.kts" "app/build.gradle" )
+# Web markers — a package.json + at least one frontend-ish signal so we
+# don't mistake server-only Node projects for web apps. Signals: a
+# bundler/framework config (vite/next/webpack/rspack/esbuild), or a known
+# UI framework dep, or a top-level index.html / public/index.html.
+WEB_PKG="package.json"
+WEB_CONFIG_GLOBS=( "vite.config.*" "next.config.*" "webpack.config.*" "rspack.config.*" "esbuild.config.*" "astro.config.*" "remix.config.*" "svelte.config.*" )
+WEB_INDEX=( "index.html" "public/index.html" "src/index.html" )
+WEB_DEPS_HINT_RE='\"(react|react-dom|vue|svelte|next|nuxt|preact|solid-js|astro|remix|@angular/core|@sveltejs/kit)\"\s*:'
 ```
 
 Priority rules:
-1. Both present (very rare — KMP repo) → ask the user which one to target.
+1. iOS+Android both present (very rare — KMP repo) → ask user which to target.
 2. Only iOS markers → `PLATFORM=ios`.
 3. Only Android markers → `PLATFORM=android`.
-4. Neither → stop. This isn't a project we know how to integrate.
+4. Web signal present (`package.json` AND (a config file matches `WEB_CONFIG_GLOBS` OR `package.json` content matches `WEB_DEPS_HINT_RE` OR an `index.html` exists in `WEB_INDEX`)) → `PLATFORM=web`.
+5. iOS or Android **and** web signals both present → prefer the native marker (it's a hybrid repo with a docs/landing-page subdir); web targeting requires `cd` into the web sub-project first.
+6. None of the above → stop. Not a project we know how to integrate.
 
 Save `PLATFORM` and reuse it everywhere downstream.
 
@@ -346,6 +361,90 @@ Confirm it links cleanly. If it fails on "no such module 'SimConsole'", the proj
 
 ---
 
+## Section WEB-I — `integrate` on Web
+
+### W1 — Detect the web project layout
+
+```bash
+# Already confirmed PLATFORM=web by P0. Now pin down where to inject the
+# bootstrap call. Try (in order):
+#  1. Vite — index.html script tag + src/main.{ts,js,jsx,tsx}
+#  2. Next.js (app router) — app/layout.{ts,tsx,js,jsx}
+#  3. Next.js (pages router) — pages/_app.{ts,tsx,js,jsx}
+#  4. Generic — package.json "main"/"module" or src/index.{js,ts}
+ENTRY=""
+if [ -f "vite.config.ts" ] || [ -f "vite.config.js" ]; then FRAMEWORK="vite"
+elif [ -f "next.config.js" ] || [ -f "next.config.ts" ] || [ -f "next.config.mjs" ]; then FRAMEWORK="next"
+elif [ -f "package.json" ] && grep -q '"react-native"' package.json; then FRAMEWORK="react-native"  # bail
+else FRAMEWORK="generic"
+fi
+```
+
+Note: if `FRAMEWORK=react-native`, stop. RN apps aren't a web target — they want the iOS/Android path even though they have a `package.json`.
+
+### W2 — Add `@simconsole/web` as a dev dependency
+
+Until Phase W-F publishes the packages to npm, use a `file:` reference into the sim_logs checkout so the user gets the in-tree SDK without npm install friction:
+
+```bash
+# Detect the user's package manager. Order matters — yarn/pnpm/bun
+# users often still have a lockfile-only npm install in node_modules.
+if [ -f "pnpm-lock.yaml" ]; then PKG_MGR="pnpm add -D"
+elif [ -f "yarn.lock" ];     then PKG_MGR="yarn add -D"
+elif [ -f "bun.lockb" ];     then PKG_MGR="bun add -d"
+else                              PKG_MGR="npm install --save-dev"
+fi
+
+$PKG_MGR "file:$SIM_CONSOLE_WEB_SDK"
+```
+
+(After W-F publishes to npm this becomes `$PKG_MGR @simconsole/web`.)
+
+### W3 — Inject the `bootstrap` call
+
+Pick the right entry file for the detected framework, then insert the call as early as possible — bootstrap must happen before the page issues any `fetch()` you want captured.
+
+**Vite (`src/main.ts` or `src/main.js`):**
+```js
+// Add at the very top of the file, before any other imports if possible.
+import SimConsole from '@simconsole/web';
+if (import.meta.env.DEV) {
+  SimConsole.bootstrap({ subsystem: '<derive from package.json "name", lowercased + ".web">' });
+}
+```
+
+**Next.js App Router (`app/layout.tsx`):**
+```tsx
+'use client';
+import { useEffect } from 'react';
+import SimConsole from '@simconsole/web';
+
+// In RootLayout's component body:
+useEffect(() => {
+  if (process.env.NODE_ENV === 'development') {
+    SimConsole.bootstrap({ subsystem: '<from package.json>' });
+  }
+}, []);
+```
+
+**Next.js Pages Router (`pages/_app.tsx`):** same pattern inside `MyApp`'s `useEffect`.
+
+**Generic / unknown framework:** add a `<script type="module">` to the page's HTML that imports the SDK and calls `bootstrap`. Mention this to the user explicitly so they can adapt.
+
+### W4 — (Optional) Wire WebSocket / EventSource (Phase W-B)
+
+W-A's auto-instrumentation covers `fetch` + `XMLHttpRequest`. WebSocket and EventSource are not yet captured. If the user's app uses them, mention this limitation; the wrapper will land in a future phase.
+
+### W5 — Build + verify
+
+```bash
+# Run whatever the user's package.json "dev" or "start" script is.
+# Then open the app, click around, watch the panel light up.
+$PKG_MGR run dev 2>&1 | head -20
+```
+
+---
+
 ## I — `launch` sub-command (default)
 
 Goal: spawn the `sim-console` panel beside the booted simulator/emulator, targeting the current project's app. Branch on `PLATFORM`.
@@ -574,9 +673,104 @@ Report back which sim/device + bundle id were chosen so the user can sanity-chec
 
 ---
 
+## Section WEB-L — `launch` on Web
+
+Goal: start the local bridge, spawn the panel pointed at it, and (when possible) start the user's dev server so events start flowing immediately.
+
+### W-L2 — Resolve the bridge
+
+```bash
+# Verify Node is available — the bridge is plain ESM JavaScript.
+command -v node >/dev/null || {
+  echo "sim-console (web): Node is required to run the bridge."
+  echo "Install Node 18+ via Homebrew or nvm, then retry."
+  exit 1
+}
+
+BRIDGE_PORT="${SIMCONSOLE_BRIDGE_PORT:-9229}"
+# Reject if something is already on the port — typically a previous bridge
+# instance that didn't shut down cleanly. The skill should kill it and retry,
+# not silently double-bind.
+if lsof -nP -iTCP:$BRIDGE_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+  PID_ON_PORT=$(lsof -nP -iTCP:$BRIDGE_PORT -sTCP:LISTEN -t | head -1)
+  CMD_ON_PORT=$(ps -p "$PID_ON_PORT" -o command= 2>/dev/null)
+  if echo "$CMD_ON_PORT" | grep -q 'simconsole-bridge'; then
+    echo "killing previous simconsole-bridge (pid $PID_ON_PORT)"
+    kill "$PID_ON_PORT" && sleep 0.3
+  else
+    echo "sim-console (web): port $BRIDGE_PORT is in use by another process:"
+    echo "  $CMD_ON_PORT"
+    echo "Choose a different port via SIMCONSOLE_BRIDGE_PORT, or stop that process."
+    exit 1
+  fi
+fi
+```
+
+### W-L3 — Derive the subsystem from `package.json`
+
+```bash
+SUBSYSTEM=$(python3 -c '
+import json, sys
+try:
+    p = json.load(open("package.json"))
+    name = p.get("name", "web.app")
+    # Strip scope (@acme/foo → foo), kebabify, append ".web"
+    base = name.split("/")[-1].lower()
+    print(f"{base}.web")
+except Exception:
+    print("web.app")
+')
+```
+
+### W-L4 — Start the bridge in the background
+
+```bash
+# Log the bridge's startup to a temp file so we can show it if it crashes.
+BRIDGE_LOG="/tmp/simconsole-bridge-$$.log"
+node "$SIM_CONSOLE_BRIDGE" --quiet --port "$BRIDGE_PORT" > "$BRIDGE_LOG" 2>&1 &
+BRIDGE_PID=$!
+sleep 0.4
+if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+  echo "bridge failed to start. Log:"
+  cat "$BRIDGE_LOG"
+  exit 1
+fi
+echo "bridge listening on http://127.0.0.1:$BRIDGE_PORT (pid $BRIDGE_PID)"
+```
+
+### W-L5 — Spawn the panel
+
+```bash
+open -n -a "$SIM_CONSOLE_APP" --args \
+  --platform web \
+  --bundle-id "$SUBSYSTEM" \
+  --width 560 --gap 8 --side right --level info \
+  --tab "metric|Metrics|web" \
+  --tab "network|Network|web" \
+  --tab "analytics|Analytics|web" \
+  --tab "text|Logs|web" \
+  --tab "text|Errors|web" \
+  --tab "text|All|web"
+```
+
+Web tabs use a placeholder predicate (`web`) because there's no platform-specific filter syntax — events are pre-filtered by the SDK before reaching the panel. The panel's existing kind-dispatch (metric/network/analytics/text) routes each line to the right typed view based on the JSON `kind` field.
+
+### W-L6 — Tell the user how to drive it
+
+After launching, tell the user:
+1. Open their dev URL in a browser (if they haven't already).
+2. Reload the page so the SDK bootstraps fresh and emits a `session.register`.
+3. Click around — events should land in the panel's tabs in real time.
+
+If no events flow within ~10 s of interaction, point them at the smoke tests in `web/sdk/test/sdk.test.mjs` and `web/bridge/test/server.test.mjs`, and check the bridge log at `$BRIDGE_LOG` for parse errors.
+
+---
+
 ## Killing the console
 
 `pkill sim-console` — or just quit Simulator.app and the console auto-exits.
+
+For the web path, also kill the bridge: `pkill -f simconsole-bridge` (or kill the saved `$BRIDGE_PID` from W-L4).
 
 ---
 

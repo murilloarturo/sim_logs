@@ -229,6 +229,19 @@ const SimConsole = {
     state.appStartTime = performance.now();
     state.bootstrapped = true;
 
+    // Page discovery: identify which page is sending. Surfaces in the
+    // panel's All tab today; future panel UI (W-D follow-up) will pin the
+    // most recent session to the header so the user knows which tab/origin
+    // is being watched when multiple browser tabs are connected.
+    send({
+      kind: 'session.register',
+      subsystem: state.subsystem,
+      origin: typeof location !== 'undefined' ? location.origin : '',
+      pathname: typeof location !== 'undefined' ? location.pathname : '',
+      title: typeof document !== 'undefined' ? document.title : '',
+      user_agent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+    });
+
     send({
       kind: 'metric.launch.start',
       ts: (typeof performance !== 'undefined' && performance.timeOrigin)

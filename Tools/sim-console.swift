@@ -1451,17 +1451,21 @@ struct AttachToggle: View {
                 state.attached.toggle()
                 diag("AttachToggle → \(state.attached ? "attached" : "detached")")
             }) {
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
                     Image(systemName: state.attached ? "pin.slash.fill" : "pin.fill")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                     Text(state.attached ? "Detach" : "Attach")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                 }
                 .foregroundColor(.black)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2)
-                .background(Color.black.opacity(0.10))
-                .cornerRadius(4)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white)
+                .cornerRadius(6)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.black.opacity(0.15), lineWidth: 1)
+                )
             }
             .buttonStyle(.plain)
             .help(state.attached
@@ -1473,37 +1477,170 @@ struct AttachToggle: View {
 
 struct SegmentBar: View {
     @ObservedObject var state: ConsoleState
+    /// True when the tab strip needs more horizontal room than the
+    /// container provides → render the prev/next arrows and clip the
+    /// strip; programmatic scroll keeps the active tab in view.
+    @State private var tabsOverflow = false
+
     var body: some View {
         HStack(spacing: 8) {
-            // Tabs go in a horizontal ScrollView so they don't get truncated
-            // or wrap when the window is narrow. The scroll indicator hides
-            // by default but a horizontal trackpad swipe reveals the rest.
-            ScrollView(.horizontal, showsIndicators: false) {
+            // Tab strip: lives in its own clipped region with NO user
+            // scroll gesture. When tabs overflow, the chevron buttons on
+            // either side step the active selection through the list.
+            // `scrollDisabled(true)` is iOS 16+ / macOS 13+ — kills the
+            // trackpad swipe so the only way to move between tabs is the
+            // tab chip itself or the arrows.
+            ScrollViewReader { proxy in
                 HStack(spacing: 4) {
-                    ForEach(Array(state.tabs.enumerated()), id: \.element.id) { idx, tab in
-                        SegmentChip(
-                            label: tab.spec.name,
-                            badge: tab === state.activeTab ? 0 : tab.unread,
-                            active: idx == state.activeIndex,
-                            // Metric tabs are *always* live recording from the
-                            // moment the panel attaches — surface that with a
-                            // pulsing red dot instead of an ever-growing event
-                            // counter the user can't act on.
-                            isLiveStream: tab.spec.kind == .metric
+                    if tabsOverflow {
+                        ArrowButton(systemName: "chevron.left", enabled: state.activeIndex > 0) {
+                            let next = max(0, state.activeIndex - 1)
+                            state.select(next)
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo(state.tabs[next].id, anchor: .center)
+                            }
+                        }
+                    }
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(Array(state.tabs.enumerated()), id: \.element.id) { idx, tab in
+                                SegmentChip(
+                                    label: tab.spec.name,
+                                    badge: tab === state.activeTab ? 0 : tab.unread,
+                                    active: idx == state.activeIndex,
+                                    // Metric tabs are *always* live recording from the
+                                    // moment the panel attaches — surface that with a
+                                    // pulsing red dot instead of an ever-growing event
+                                    // counter the user can't act on.
+                                    isLiveStream: tab.spec.kind == .metric
+                                )
+                                .id(tab.id)
+                                .onTapGesture {
+                                    state.select(idx)
+                                    withAnimation(.easeOut(duration: 0.15)) {
+                                        proxy.scrollTo(tab.id, anchor: .center)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.trailing, 4)
+                        .background(
+                            // Measure the intrinsic tab-strip width and
+                            // compare to the container so we know whether
+                            // arrows are needed. PreferenceKey carries the
+                            // measurement up to the outer GeometryReader.
+                            GeometryReader { tabsGeo in
+                                Color.clear.preference(
+                                    key: TabsContentWidthKey.self,
+                                    value: tabsGeo.size.width
+                                )
+                            }
                         )
-                        .onTapGesture { state.select(idx) }
+                    }
+                    .scrollDisabled(true)
+                    if tabsOverflow {
+                        ArrowButton(systemName: "chevron.right", enabled: state.activeIndex < state.tabs.count - 1) {
+                            let next = min(state.tabs.count - 1, state.activeIndex + 1)
+                            state.select(next)
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo(state.tabs[next].id, anchor: .center)
+                            }
+                        }
                     }
                 }
-                .padding(.trailing, 4)
             }
-            // Attach/Detach toggle pinned on the right, separated from the
-            // tab strip by the 8pt HStack spacing. Hidden entirely on
-            // platforms where there's no on-screen device window to dock to
-            // (USB iPhone, Android — see AttachToggle's `attachAvailable`).
+            // Attach/Detach toggle pinned on the right, OUTSIDE the tab
+            // region's scrollview. `layoutPriority(1)` makes SwiftUI
+            // reserve its intrinsic width first so it's always visible
+            // regardless of how many tabs are showing. Hidden entirely on
+            // platforms where there's no on-screen device window to dock
+            // to (USB iPhone, Android, web — see AttachToggle's
+            // `attachAvailable` guard).
             AttachToggle(state: state)
+                .layoutPriority(1)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
+        .background(
+            // Outer GeometryReader catches the parent width so we can
+            // compare against the tab-strip width preference.
+            GeometryReader { outerGeo in
+                Color.clear.preference(
+                    key: SegmentBarWidthKey.self,
+                    value: outerGeo.size.width
+                )
+            }
+        )
+        .onPreferenceChange(TabsContentWidthKey.self) { tabsW in
+            tabsContentWidth = tabsW
+            recomputeOverflow()
+        }
+        .onPreferenceChange(SegmentBarWidthKey.self) { barW in
+            barWidth = barW
+            recomputeOverflow()
+        }
+    }
+
+    /// Latest measurements from the two preference keys. Kept as @State so
+    /// updates flow through the normal SwiftUI publishing pipeline (no
+    /// global / actor-isolated storage to chase).
+    @State private var tabsContentWidth: CGFloat = 0
+    @State private var barWidth: CGFloat = 0
+
+    private func recomputeOverflow() {
+        // 90pt is a generous estimate of the AttachToggle's width
+        // (Attach / Detach labels both fit). Add 24pt of slack for the
+        // HStack spacing + per-side padding so we don't toggle modes
+        // when the strip is right at the edge.
+        let toggleEstimate: CGFloat = 90
+        let slack: CGFloat = 24
+        guard barWidth > 0, tabsContentWidth > 0 else { return }
+        tabsOverflow = tabsContentWidth + toggleEstimate + slack > barWidth
+    }
+}
+
+/// Preference key carrying the tab strip's intrinsic content width up to
+/// SegmentBar's overflow detector.
+private struct TabsContentWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Preference key carrying SegmentBar's own outer width.
+private struct SegmentBarWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let v = nextValue()
+        if v > 0 { value = v }
+    }
+}
+
+/// Small chevron button styled like AttachToggle (white background,
+/// black icon, subtle border) so the bar reads as one coherent control
+/// strip. Disabled when there's no tab to step to in that direction.
+private struct ArrowButton: View {
+    let systemName: String
+    let enabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: enabled ? action : {}) {
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(enabled ? .black : .gray)
+                .frame(width: 24, height: 24)
+                .background(Color.white)
+                .cornerRadius(6)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.black.opacity(0.15), lineWidth: 1)
+                )
+                .opacity(enabled ? 1 : 0.5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
     }
 }
 

@@ -405,9 +405,9 @@ open -n -a "$SIM_CONSOLE_APP" --args \
   --bundle-id "$APPLICATION_ID" \
   --width 560 --gap 8 --side right \
   $DETACHED_FLAG \
-  --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
-  --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
   --tab "metric|Metrics|SimConsole.metric:V SimConsole.metric.chunk:V *:S" \
+  --tab "network|Network|SimConsole.network:V SimConsole.network.chunk:V *:S" \
+  --tab "analytics|Analytics|SimConsole.analytics:V SimConsole.analytics.chunk:V *:S" \
   --tab "text|Logs|SimConsole.event:V SimConsole.event.chunk:V *:S" \
   --tab "text|Errors|*:E *:F" \
   --tab "text|All|*:V"
@@ -531,10 +531,12 @@ open -n -a "$SIM_CONSOLE_APP" --args \
   --tag "$SIM_NAME" \
   --bundle-id "$BUNDLE_ID" \
   --width 560 --gap 8 --side right --level info \
-  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
-  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
   --tab "metric|Metrics|subsystem == \"$BUNDLE_ID\" AND category == \"metric\"" \
-  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\""
+  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
+  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
+  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\"" \
+  --tab "text|Errors|subsystem == \"$BUNDLE_ID\" AND (messageType == \"error\" OR messageType == \"fault\")" \
+  --tab "text|All|subsystem == \"$BUNDLE_ID\""
 ```
 
 The simulator path opens *attached* — the panel snaps next to the Simulator window via Accessibility-API lookup and tracks it. Click the **Detach** button in the header to free the panel; click **Attach** to snap it back.
@@ -547,10 +549,12 @@ open -n -a "$SIM_CONSOLE_APP" --args \
   --bundle-id "$BUNDLE_ID" \
   --idevicesyslog-path "$IDEVICESYSLOG_PATH" \
   --width 560 --gap 8 --side right \
-  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
-  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
   --tab "metric|Metrics|subsystem == \"$BUNDLE_ID\" AND category == \"metric\"" \
-  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\""
+  --tab "network|Network|subsystem == \"$BUNDLE_ID\" AND category == \"network\"" \
+  --tab "analytics|Analytics|subsystem == \"$BUNDLE_ID\" AND category == \"analytics\"" \
+  --tab "text|Logs|subsystem == \"$BUNDLE_ID\" AND category == \"event\"" \
+  --tab "text|Errors|subsystem == \"$BUNDLE_ID\" AND (messageType == \"error\" OR messageType == \"fault\")" \
+  --tab "text|All|subsystem == \"$BUNDLE_ID\""
 ```
 
 Notes for the USB-device path:

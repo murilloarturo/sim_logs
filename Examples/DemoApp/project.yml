@@ -37,3 +37,5 @@ targets:
         SUPPORTS_MACCATALYST: NO
     dependencies:
       - package: SimConsole
+        embed: true
+        link: true

@@ -65,6 +65,13 @@ struct Args {
     /// empty. Used for streaming logs from a USB-connected iPhone since
     /// `xcrun devicectl` doesn't have a log-stream subcommand.
     var ideviceSyslogPath: String = ""
+    /// Explicit override for the iOS device executable name passed to
+    /// `idevicesyslog -p <name>`. Defaults to the bundle id's last component,
+    /// which only works when CFBundleExecutable matches that suffix (e.g.
+    /// bundle id `com.acme.demoapp` and executable `demoapp`). For projects
+    /// where PRODUCT_NAME differs in case (`DemoApp`) or shape, callers can
+    /// pass `--ios-process-name DemoApp` to override.
+    var iosProcessName: String = ""
     /// When true, the panel is a user-positionable floating window rather
     /// than a borderless overlay that tracks the sim/emulator. Required for
     /// USB-connected physical devices (no on-screen device window to dock to).
@@ -117,6 +124,7 @@ func parseArgs() -> Args {
             i += 2
         case "--adb-path":  a.adbPath = argv[i+1]; i += 2
         case "--idevicesyslog-path": a.ideviceSyslogPath = argv[i+1]; i += 2
+        case "--ios-process-name": a.iosProcessName = argv[i+1]; i += 2
         case "--detached":  a.detached = true; i += 1
         default: i += 1
         }
@@ -225,12 +233,24 @@ func windowFrame(_ window: AXUIElement) -> CGRect? {
     return CGRect(origin: pos, size: size)
 }
 
+/// Convert a top-down screen-space rect (from AX or CGWindow) into Cocoa's
+/// bottom-up space. The *primary* display anchors both coordinate systems:
+/// CGWindow's origin is the primary's top-left; Cocoa's origin is the
+/// primary's bottom-left. The flip is `cocoa_y = primary_height - cg_y - cg_height`.
+///
+/// `NSScreen.screens.first` is documented as having unspecified order — on a
+/// multi-monitor setup the first array entry may not be the primary, which
+/// would make the conversion silently wrong. Find the primary explicitly by
+/// the screen whose Cocoa frame.origin == .zero (the menu-bar display).
 func axToCocoa(_ axRect: CGRect) -> CGRect {
-    guard let primary = NSScreen.screens.first else { return axRect }
-    let topY = primary.frame.maxY
+    let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero })
+        ?? NSScreen.main
+        ?? NSScreen.screens.first
+    guard let primary else { return axRect }
+    let primaryHeight = primary.frame.height
     return CGRect(
         x: axRect.origin.x,
-        y: topY - axRect.origin.y - axRect.size.height,
+        y: primaryHeight - axRect.origin.y - axRect.size.height,
         width: axRect.size.width,
         height: axRect.size.height
     )
@@ -254,9 +274,23 @@ func simulatorAppRunning() -> Bool {
 /// largest layer-0 window (which is always the device screen; toolbars and
 /// extended controls are smaller / on higher layers).
 func findEmulatorWindowFrame(matching tag: String = "") -> CGRect? {
+    // The Android emulator can render as multiple adjacent on-screen windows
+    // — e.g. the Pixel device screen plus a separate extended-controls
+    // sidebar (`qemu-system-*`) sitting right next to it. The user sees them
+    // as one visual footprint, so the docking edge for SimConsole must be the
+    // outer edge of the *union* of all qemu windows, not just the largest one.
+    //
+    // Returning only the biggest window would dock the panel *inside* the
+    // sidebar (or leave a sidebar-sized gap on the other side), which the
+    // user perceives as "attach is broken".
+    //
+    // We anchor on the largest qemu window (the device screen — at least
+    // 100px tall to skip the thin titlebar widgets), then expand the rect to
+    // include every other layer-0 qemu window whose bounds intersect or
+    // touch it. Touch test uses 2px slop so a 0-1px CGWindow gap between
+    // adjacent windows still counts as adjacent.
     let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
-    var best: CGRect?
-    var bestArea: CGFloat = 0
+    var rects: [CGRect] = []
     for w in list {
         let owner = (w[kCGWindowOwnerName as String] as? String ?? "").lowercased()
         guard owner.hasPrefix("qemu") else { continue }
@@ -266,16 +300,41 @@ func findEmulatorWindowFrame(matching tag: String = "") -> CGRect? {
         let y = CGFloat(truncating: bnds["Y"] ?? 0)
         let width = CGFloat(truncating: bnds["Width"] ?? 0)
         let height = CGFloat(truncating: bnds["Height"] ?? 0)
-        // Skip degenerate / hidden surfaces — the device screen is always
-        // taller than the toolbar widgets.
-        guard width > 0, height > 100 else { continue }
-        let area = width * height
-        if area > bestArea {
-            bestArea = area
-            best = CGRect(x: x, y: y, width: width, height: height)
+        guard width > 0, height > 0 else { continue }
+        rects.append(CGRect(x: x, y: y, width: width, height: height))
+    }
+    // Anchor on the largest one taller than 100px — that's the device screen.
+    let anchor = rects
+        .filter { $0.height > 100 }
+        .max { ($0.width * $0.height) < ($1.width * $1.height) }
+    guard var combined = anchor else { return nil }
+    // Iteratively absorb any other qemu window that's visually adjacent
+    // *side-by-side* with the current combined rect. The emulator's
+    // sidebar/extended-controls window typically sits a few pixels to the
+    // right of the device screen (observed: ~7px gap), so we use a 12px X
+    // slop to count those as adjacent.
+    //
+    // Vertical filter: a popup menu / dropdown from the toolbar can appear
+    // above or below the device screen with no Y-overlap; absorbing those
+    // makes the union rect jitter every tick. So require at least 50% Y
+    // overlap with the current combined rect before absorbing.
+    let xSlop: CGFloat = 12
+    var grew = true
+    while grew {
+        grew = false
+        for r in rects where r != combined && !combined.contains(r) {
+            // X-adjacency: their X ranges touch (with 12px slop)
+            let xTouches = (r.minX - xSlop) <= combined.maxX && (r.maxX + xSlop) >= combined.minX
+            if !xTouches { continue }
+            // Y-overlap >= 50% of the smaller window's height
+            let yOverlap = max(0, min(combined.maxY, r.maxY) - max(combined.minY, r.minY))
+            let yRequired = 0.5 * min(combined.height, r.height)
+            if yOverlap < yRequired { continue }
+            combined = combined.union(r)
+            grew = true
         }
     }
-    return best
+    return combined
 }
 
 /// Mirrors `simulatorAppRunning()`. CGWindowList sees qemu's windows even
@@ -653,6 +712,24 @@ final class TabViewModel: ObservableObject, Identifiable {
     private let maxEntries: Int = 1000
     private let chunker = ChunkAssembler()
     weak var exporter: Exporter?
+    /// Source-module substring to match in each idevicesyslog line. On the
+    /// iOS-device path idevicesyslog only filters by process name and dumps
+    /// every os_log call under that process — UIKitCore, RunningBoardServices,
+    /// HangTracer, CoreFoundation, etc. Without an additional filter every
+    /// tab would fill its 1000-entry buffer with UIKit chatter and evict the
+    /// real SimConsole events within seconds.
+    ///
+    /// Apple's unified log attaches the calling Swift module name to each
+    /// record, and idevicesyslog renders that in parens after the process:
+    ///   "May 26 11:08 DemoApp(SimConsole)[49149] <Notice>: {...}"
+    ///   "May 26 11:08 DemoApp(UIKitCore)[49149] <Notice>: handleKeyboard..."
+    /// We match on "(SimConsole)[" to accept SDK emissions and reject the
+    /// rest. The per-tab kind dispatch downstream then routes JSON events to
+    /// the right typed view.
+    ///
+    /// Empty string means "accept everything" — used by the "All" tab so the
+    /// user can still see UIKit / RunningBoardServices noise when debugging.
+    private var iosDeviceLineFilter: String = ""
 
     init(spec: TabSpec) {
         self.id = "\(spec.kind.rawValue)-\(spec.name)"
@@ -660,16 +737,42 @@ final class TabViewModel: ObservableObject, Identifiable {
     }
 
     func start(args: Args) {
+        // For the USB-device path, idevicesyslog can only filter by process
+        // name. Typed tabs (metric/network/analytics + the "Logs" event tab)
+        // want only SDK emissions and would otherwise be drowned in UIKit
+        // chatter. The "All" tab — identified by the absence of a category
+        // constraint in the tab's predicate — wants the firehose so a
+        // developer can see the entire process's log stream.
+        if args.platform == .ios && args.detached {
+            let hasCategoryConstraint = Self.extractCategoryFromPredicate(spec.predicate).isEmpty == false
+            iosDeviceLineFilter = hasCategoryConstraint ? "(SimConsole)[" : ""
+        }
         switch args.platform {
         case .ios:
             if args.detached {
-                startIOSDevice(udid: args.device, ideviceSyslogPath: args.ideviceSyslogPath, bundleId: args.bundleId)
+                startIOSDevice(udid: args.device, ideviceSyslogPath: args.ideviceSyslogPath, bundleId: args.bundleId, iosProcessName: args.iosProcessName)
             } else {
                 startIOSSimulator(device: args.device, level: args.level)
             }
         case .android:
             startAndroid(serial: args.device, adbPath: args.adbPath)
         }
+    }
+
+    /// Pull the `category == "X"` constraint out of an NSPredicate string.
+    /// Returns "" if the predicate doesn't have one — e.g. the "All" tab.
+    private static func extractCategoryFromPredicate(_ predicate: String) -> String {
+        // Match: category == "metric" (with optional whitespace around ==).
+        // The predicate strings the skill emits are stable enough for a
+        // simple regex; we explicitly do NOT try to parse the whole NSPredicate.
+        guard let r = predicate.range(of: #"category\s*==\s*\"([^\"]+)\""#, options: .regularExpression)
+        else { return "" }
+        // Slice out just the captured group.
+        let slice = predicate[r]
+        guard let q = slice.range(of: "\"") else { return "" }
+        let after = slice.index(after: q.lowerBound)
+        guard let qEnd = slice.range(of: "\"", range: after..<slice.endIndex) else { return "" }
+        return String(slice[after..<qEnd.lowerBound])
     }
 
     private func startIOSSimulator(device: String, level: String) {
@@ -692,7 +795,7 @@ final class TabViewModel: ObservableObject, Identifiable {
     /// log-stream subcommand — only `launch / signal / suspend / resume`.
     /// libimobiledevice's `idevicesyslog` is the only off-the-shelf path
     /// that surfaces the unified log from a paired USB device.
-    private func startIOSDevice(udid: String, ideviceSyslogPath: String, bundleId: String) {
+    private func startIOSDevice(udid: String, ideviceSyslogPath: String, bundleId: String, iosProcessName: String) {
         let proc = Process()
         let path = ideviceSyslogPath.isEmpty ? "idevicesyslog" : ideviceSyslogPath
         proc.executableURL = URL(fileURLWithPath: path.hasPrefix("/") ? path : "/usr/bin/env")
@@ -702,12 +805,16 @@ final class TabViewModel: ObservableObject, Identifiable {
         // `-x` makes idevicesyslog exit when the device disconnects, which
         // tickDetached picks up via the dead subprocess.
         argv.append("-x")
-        // Filter to the target app's process when we know the bundle id.
-        // idevicesyslog filters by process name, which equals the bundle's
-        // CFBundleExecutable — close enough for the common case where the
-        // executable name is the same as the last component of the bundle id.
-        if !bundleId.isEmpty {
-            argv.append(contentsOf: ["-p", bundleId.split(separator: ".").last.map(String.init) ?? bundleId])
+        // idevicesyslog's `-p` matches process names case-sensitively, which
+        // equals the app's CFBundleExecutable on iOS. Caller can override via
+        // --ios-process-name (e.g. when PRODUCT_NAME = "DemoApp" but bundle
+        // id ends in "demoapp"). Without an override we derive from the
+        // bundle id's last component as the best-effort default.
+        let procName: String? = iosProcessName.isEmpty
+            ? (bundleId.isEmpty ? nil : bundleId.split(separator: ".").last.map(String.init))
+            : iosProcessName
+        if let procName, !procName.isEmpty {
+            argv.append(contentsOf: ["-p", procName])
         }
         proc.arguments = argv
         runStreamingProcess(proc, label: "ios-device")
@@ -767,7 +874,13 @@ final class TabViewModel: ObservableObject, Identifiable {
         let lines = combined.split(separator: "\n", omittingEmptySubsequences: false)
         carry = combined.hasSuffix("\n") ? "" : String(lines.last ?? "")
         for line in lines.dropLast() where !line.isEmpty {
-            ingest(String(line))
+            let s = String(line)
+            // iOS-device firehose filter: drop non-SDK lines for typed tabs.
+            // See `iosDeviceLineFilter` doc for the rationale and format.
+            if !iosDeviceLineFilter.isEmpty, !s.contains(iosDeviceLineFilter) {
+                continue
+            }
+            ingest(s)
         }
     }
 
@@ -1280,7 +1393,10 @@ struct AttachToggle: View {
     @ObservedObject var state: ConsoleState
     var body: some View {
         if state.attachAvailable {
-            Button(action: { state.attached.toggle() }) {
+            Button(action: {
+                state.attached.toggle()
+                diag("AttachToggle → \(state.attached ? "attached" : "detached")")
+            }) {
                 HStack(spacing: 4) {
                     Image(systemName: state.attached ? "pin.slash.fill" : "pin.fill")
                         .font(.system(size: 10, weight: .semibold))
@@ -2679,6 +2795,7 @@ final class Controller {
     var iosMockSync: IOSMockSync?
     let frameStore: PanelFrameStore?
     private var frameObserver: NSObjectProtocol?
+    private var attachSubscription: Any?
 
     init(args: Args) {
         self.args = args
@@ -2713,8 +2830,16 @@ final class Controller {
         // titled / resizable / closable window. Attach/Detach state controls
         // *whether* it tracks the sim/emulator window (set on .level + the
         // re-dock logic in tick()), not the window chrome.
+        //
+        // Default behavior: panel launches *detached* (user can drag) but
+        // positioned next to the sim/emulator on first paint so the user
+        // doesn't have to. Clicking "Attach" later makes it follow the sim's
+        // window as it moves.
+        let snapFrame: NSRect? = args.detached ? nil : Controller.snapBesideDevice(args: args)
         let savedFrame = frameStore?.load()
-        let initialFrame = savedFrame ?? NSRect(x: 100, y: 100, width: args.width, height: 700)
+        let initialFrame = snapFrame
+            ?? savedFrame
+            ?? NSRect(x: 100, y: 100, width: args.width, height: 700)
 
         let panel = KeyablePanel(
             contentRect: initialFrame,
@@ -2726,17 +2851,38 @@ final class Controller {
         panel.isOpaque = true
         panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         panel.hasShadow = true
-        panel.collectionBehavior = [.fullScreenAuxiliary]
+        // Panel behaviors that keep it visible across app activations.
+        // Without these, clicking on the Simulator window deactivates our app
+        // and NSPanel hides itself; the next tick then re-shows it, producing
+        // a flash. Setting hidesOnDeactivate = false + isFloatingPanel = true
+        // keeps it on screen at .floating level even when we're not the active app.
+        panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.minSize = NSSize(width: 360, height: 320)
         panel.isReleasedWhenClosed = false
-        // Default to a sim/emulator-tracking window (attached mode) when we
-        // expect to find an on-screen device. USB-device launches start in
-        // freestanding mode AND hide the attach toggle, since there's no
-        // device window on the Mac to snap against.
-        let attachedInitially = !args.detached
-        state.attached = attachedInitially
-        state.attachAvailable = !args.detached
-        panel.level = attachedInitially ? .floating : .normal
+        // Hide the green zoom button. Without this, double-clicking the title
+        // bar or clicking the green button puts the window in `isZoomed` state,
+        // and AppKit re-applies that target size after every setFrame — which
+        // fights our 200ms re-snap in attached mode and produces a fullscreen
+        // ↔ snapped oscillation. We don't need zoom on either path: attached
+        // mode wants the panel anchored to the device window; detached mode
+        // lets the user drag and resize manually.
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        // Always launch detached so the user can immediately reposition.
+        // attachAvailable depends on whether a device window exists to dock
+        // against — USB-device launches hide the toggle entirely. Android is
+        // also hidden: qemu emits multiple separate windows (device screen +
+        // sidebar + transient popups) and our union-bounds heuristic can't
+        // reliably produce a stable docking edge across emulator skins, so
+        // the panel runs as a freely-movable window beside the emulator on
+        // Android instead.
+        state.attached = false
+        state.attachAvailable = !args.detached && args.platform != .android
+        panel.level = .floating
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = true
 
         let hosting = NSHostingView(rootView: RootView(state: state))
         hosting.frame = NSRect(origin: .zero, size: panel.frame.size)
@@ -2767,6 +2913,34 @@ final class Controller {
             if !self.state.attached, let store = self.frameStore {
                 store.save(panel.frame)
             }
+        }
+
+        // React immediately when the user toggles Attach/Detach. Waiting for
+        // the next 200ms tick is technically fine but feels laggy, and we
+        // also need to flip `isMovable` exactly when the state changes so
+        // the user can drag in detached mode and can't fight the docking
+        // logic in attached mode.
+        attachSubscription = state.$attached.dropFirst().sink { [weak self] attached in
+            DispatchQueue.main.async {
+                self?.applyAttachChange(attached: attached)
+            }
+        }
+    }
+
+    /// Apply side-effects of an attach/detach transition. Called from the
+    /// state.$attached subscription so the UI feels instant.
+    private func applyAttachChange(attached: Bool) {
+        diag("attach change → \(attached ? "attached" : "detached")")
+        panel.isMovable = !attached
+        panel.isMovableByWindowBackground = !attached
+        if attached {
+            // Snap to the sim/emulator right now rather than waiting for the
+            // next tick. tick() reads state.attached and will re-dock.
+            tick()
+        } else {
+            // Detached: leave the panel where it is. The didMove observer
+            // will start persisting any subsequent drags to PanelFrameStore.
+            if let store = frameStore { store.save(panel.frame) }
         }
     }
 
@@ -2815,20 +2989,22 @@ final class Controller {
         }
 
         // Detached *via the UI toggle*: leave the user's frame alone. Window
-        // stays visible — we just don't re-dock.
+        // stays visible — we just don't re-dock. Level stays .floating so the
+        // window doesn't vanish behind Simulator when the user clicks the device.
         if !state.attached {
-            // Window level should be .normal so it behaves like a regular
-            // app window the user can put behind other things.
-            if panel.level != .normal { panel.level = .normal }
             if !panel.isVisible { panel.orderFrontRegardless() }
             return
         }
 
-        // Attached: snap beside the sim/emulator window. Level=.floating so
-        // it stays above the device window even if focus shifts elsewhere.
+        // Attached: snap beside the sim/emulator window. If we can't locate
+        // the device window this tick (e.g., the sim was momentarily hidden
+        // or focus shifted), DON'T hide the panel — that was the
+        // overlay-era behavior and produces a flash whenever the user clicks
+        // Simulator.app. Just leave the last frame in place until the next tick.
         if panel.level != .floating { panel.level = .floating }
         guard let axRect else {
-            panel.orderOut(nil); return
+            if !panel.isVisible { panel.orderFrontRegardless() }
+            return
         }
         let cocoaRect = axToCocoa(axRect)
 
@@ -2849,8 +3025,20 @@ final class Controller {
             )
         }
 
-        if overlayRect != lastFrame {
-            diag("frame → \(Int(overlayRect.minX)),\(Int(overlayRect.minY)) \(Int(overlayRect.width))x\(Int(overlayRect.height))")
+        // Compare against the panel's *actual* frame, not a cached value, so
+        // re-attach after the user dragged the panel in detached mode also
+        // snaps it back. If AppKit somehow ended up zoomed (despite the hidden
+        // zoom button — e.g. menu-bar Window > Zoom), un-zoom first so the
+        // next setFrame sticks instead of triggering a re-zoom on the next pass.
+        if overlayRect != panel.frame {
+            if panel.isZoomed { panel.zoom(nil) }
+            diag(String(format:
+                "frame: device(cg)=%d,%d %dx%d → device(cocoa)=%d,%d %dx%d → panel=%d,%d %dx%d (was %d,%d %dx%d)",
+                Int(axRect.minX), Int(axRect.minY), Int(axRect.width), Int(axRect.height),
+                Int(cocoaRect.minX), Int(cocoaRect.minY), Int(cocoaRect.width), Int(cocoaRect.height),
+                Int(overlayRect.minX), Int(overlayRect.minY), Int(overlayRect.width), Int(overlayRect.height),
+                Int(panel.frame.minX), Int(panel.frame.minY), Int(panel.frame.width), Int(panel.frame.height)
+            ))
             panel.setFrame(overlayRect, display: true)
             lastFrame = overlayRect
         }
@@ -2880,12 +3068,56 @@ final class Controller {
         }
     }
 
-    /// Returns true if `xcrun devicectl list devices --json-output` reports the
-    /// given UDID in the `connected`/`available` state. Spawns a one-shot
-    /// process every tick — devicectl is relatively expensive (~hundreds of
-    /// ms) so we accept some lag here in exchange for not maintaining a
-    /// separate USB-mux subscription.
+    /// Compute the one-shot "open beside the sim/emulator" frame used at
+    /// startup so the panel lands next to the device window before the user
+    /// ever sees it. Returns nil for USB-device launches or when the device
+    /// window can't be located (in which case the caller falls back to
+    /// `PanelFrameStore` or a default rect).
+    static func snapBesideDevice(args: Args) -> NSRect? {
+        let axRect: CGRect?
+        switch args.platform {
+        case .ios:
+            guard simulatorAppRunning(),
+                  let window = findSimulatorWindow(matching: args.tag, fallback: args.altTag)
+            else { return nil }
+            axRect = windowFrame(window)
+        case .android:
+            guard emulatorAppRunning() else { return nil }
+            axRect = findEmulatorWindowFrame(matching: args.tag)
+        }
+        guard let axRect else { return nil }
+        let cocoaRect = axToCocoa(axRect)
+        if args.side == "left" {
+            return NSRect(
+                x: cocoaRect.minX - args.width - args.gap,
+                y: cocoaRect.minY,
+                width: args.width,
+                height: cocoaRect.height,
+            )
+        }
+        return NSRect(
+            x: cocoaRect.maxX + args.gap,
+            y: cocoaRect.minY,
+            width: args.width,
+            height: cocoaRect.height,
+        )
+    }
+
+    /// Returns true if the device is reachable by either Apple's Core Device
+    /// stack (devicectl) OR libimobiledevice's usbmuxd. We need both because
+    /// the two transports drop independently — locking/unlocking the phone
+    /// often kills the Core Device tunnel for a few seconds while the usbmux
+    /// connection survives, and we don't want to tear down the panel and its
+    /// idevicesyslog subprocesses every time that happens.
     private func iosDeviceAttached(udid: String) -> Bool {
+        if iosDeviceAttachedViaDevicectl(udid: udid) { return true }
+        if iosDeviceAttachedViaUsbmux(udid: udid) { return true }
+        return false
+    }
+
+    /// Same as the legacy single-channel check, just renamed to make the
+    /// fallback structure in `iosDeviceAttached` obvious.
+    private func iosDeviceAttachedViaDevicectl(udid: String) -> Bool {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("sim-console-devicectl-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -2914,7 +3146,15 @@ final class Controller {
             guard let id = dev["identifier"] as? String,
                   let conn = dev["connectionProperties"] as? [String: Any]
             else { continue }
-            let isMatch = udid.isEmpty || id == udid
+            // Apple ships two UDIDs per device. `identifier` is the modern
+            // devicectl/Core-Device UUID (e.g. 34184143-A2AB-57B8-BD74-...);
+            // `hardwareProperties.udid` is the older ECID-derived form (e.g.
+            // 00008150-001A0C423488401C) that libimobiledevice tools require.
+            // The skill's discovery script returns whichever one Apple's
+            // tooling surfaces first, and idevicesyslog -u downstream wants
+            // the second form, so accept matches on either.
+            let hwUdid = (dev["hardwareProperties"] as? [String: Any])?["udid"] as? String
+            let isMatch = udid.isEmpty || id == udid || hwUdid == udid
             if !isMatch { continue }
             // Apple's devicectl reports tunnelState=connected when the device
             // is plugged in and the Core Device tunnel is up. Devices we've
@@ -2923,6 +3163,36 @@ final class Controller {
                tunnelState == "connected" { return true }
         }
         return false
+    }
+
+    /// Returns true if `idevice_id -l` lists any device matching the UDID
+    /// (or any device at all when UDID is empty). Faster than devicectl and
+    /// uses the usbmuxd transport — survives Core Device tunnel hiccups that
+    /// happen e.g. when the phone is locked/unlocked. Path discovery falls
+    /// back to the same Homebrew locations as idevicesyslog.
+    private func iosDeviceAttachedViaUsbmux(udid: String) -> Bool {
+        let candidates = [
+            "/opt/homebrew/bin/idevice_id",
+            "/usr/local/bin/idevice_id",
+        ]
+        let path = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+            ?? "idevice_id"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path.hasPrefix("/") ? path : "/usr/bin/env")
+        var argv: [String] = []
+        if !path.hasPrefix("/") { argv.append(path) }
+        argv.append("-l")
+        proc.arguments = argv
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return false }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return false }
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let ids = output.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }
+        if udid.isEmpty { return !ids.isEmpty }
+        return ids.contains(udid)
     }
 
     /// Returns true if `adb -s <serial> get-state` reports "device". Faster

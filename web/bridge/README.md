@@ -43,11 +43,24 @@ Options:
 |---|---|---|---|
 | POST | `/event` | single NDJSON event | append one event |
 | POST | `/events` | JSON array of events | batch append |
-| GET | `/mocks` | — | current mock rules (empty in 0.1.0; W-C will populate) |
+| GET | `/mocks` | — | snapshot of the panel's MockStore for this `--bundle-id` |
+| GET | `/mocks/stream` | — | Server-Sent Events; pushes mock updates as they happen |
 | GET | `/health` | — | `{ ok, count, out, uptime_s }` |
 
 All endpoints set `Access-Control-Allow-Origin: *` so a dev page on any
 local port can POST without preflight friction.
+
+### Mock sync
+
+When the bridge is started with `--bundle-id <id>`, it watches
+`~/.sim-console/mocks-<id>.json` — the file the macOS panel's `MockStore`
+writes — and serves a snapshot at `GET /mocks` plus live updates over
+`GET /mocks/stream` (Server-Sent Events).
+
+The `@simconsole/web` SDK uses both: a one-shot GET on bootstrap to seed
+its in-memory cache, then an `EventSource` connection to `/mocks/stream`
+so panel edits (Add Mock, Edit, Remove) take effect on the next request
+without a page reload.
 
 ## Programmatic use
 

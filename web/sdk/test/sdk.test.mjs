@@ -46,7 +46,9 @@ test('analytics() before bootstrap queues, flushes on bootstrap', async () => {
   // Allow microtasks to drain so the queued POST goes out.
   await new Promise((r) => setImmediate(r));
 
-  const events = sentRequests.map((r) => JSON.parse(r.init.body));
+  // Only POSTs to the bridge carry an event body — filter out GET /mocks
+  // calls the SDK makes during bootstrap.
+  const events = sentRequests.filter((r) => r.init?.body).map((r) => JSON.parse(r.init.body));
   // Bootstrap also emits session.register and metric.launch.start, plus
   // the queued analytics event flushes — 3 events expected.
   assert.equal(events.length, 3);
@@ -70,6 +72,7 @@ test('bootstrap emits a session.register with origin/title/user_agent', async ()
   await new Promise((r) => setImmediate(r));
 
   const session = sentRequests
+    .filter((r) => r.init?.body)
     .map((r) => JSON.parse(r.init.body))
     .find((e) => e.kind === 'session.register');
   assert.ok(session, 'session.register should be emitted');
@@ -170,6 +173,125 @@ test('log() includes message + level + fields in the event payload', async () =>
   assert.equal(evt.message, 'something went wrong');
   assert.equal(evt.level, 'error');
   assert.deepEqual(evt.fields, { code: 'E_NET' });
+});
+
+test('fetch returns the mocked Response without hitting origFetch when a matching mock is set', async () => {
+  SimConsole.bootstrap({ subsystem: 'test.app' });
+  await new Promise((r) => setImmediate(r));
+  sentRequests.length = 0;
+
+  SimConsole._setMocksForTesting([
+    {
+      id: 'm1',
+      match: { method: 'GET', url: 'https://api.example.com/users/1' },
+      response: {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: '{"id":1,"name":"mocked"}',
+      },
+      delay_ms: 0,
+      enabled: true,
+    },
+  ]);
+
+  // Track whether origFetch was called for the user's URL. Replace the
+  // current window.fetch (which the SDK has wrapped) with a counter
+  // wrapping fetchStub so we can tell the mock path from the network path.
+  let originalCallCount = 0;
+  const wrapped = window.fetch;
+  // Re-install: wrap the SDK's already-installed fetch with a counter
+  // that ONLY runs when the SDK falls through to network. We do this by
+  // replacing the underlying network stub.
+  globalThis.window.fetch = wrapped; // (no-op, just for clarity)
+  // The cleanest way: inspect the response we get.
+  const resp = await window.fetch('https://api.example.com/users/1');
+  assert.equal(resp.status, 200);
+  const body = await resp.text();
+  assert.match(body, /"name":"mocked"/);
+
+  // The panel should have received exactly net.request + net.response
+  // events, both with mocked:true. NO outbound HTTP to the mocked URL.
+  const events = sentRequests.map((r) => JSON.parse(r.init.body)).filter(
+    (e) => e.kind === 'net.request' || e.kind === 'net.response'
+  );
+  assert.equal(events.length, 2);
+  assert.ok(events.every((e) => e.mocked === true), 'both events should carry mocked:true');
+  // Verify the user's URL was NOT in the outbound requests list (i.e. we
+  // didn't actually hit the network for it).
+  const realUserCall = sentRequests.find((r) => r.url === 'https://api.example.com/users/1');
+  assert.equal(realUserCall, undefined, 'mocked URL should not be fetched for real');
+
+  // For posterity: the un-used counter avoids an unused-var lint when
+  // adapting this test to wrap origFetch directly in a future iteration.
+  void originalCallCount;
+});
+
+test('fetch falls through to the network when no mock matches', async () => {
+  SimConsole.bootstrap({ subsystem: 'test.app' });
+  await new Promise((r) => setImmediate(r));
+  sentRequests.length = 0;
+
+  SimConsole._setMocksForTesting([
+    {
+      id: 'm1',
+      match: { method: 'GET', url: 'https://api.example.com/different-url' },
+      response: { status: 200, headers: {}, body: '' },
+      delay_ms: 0,
+      enabled: true,
+    },
+  ]);
+
+  await window.fetch('https://api.example.com/users/1');
+
+  // The user's URL DID hit the network stub.
+  const realUserCall = sentRequests.find((r) => r.url === 'https://api.example.com/users/1');
+  assert.ok(realUserCall, 'non-matching mock should let the real fetch proceed');
+
+  // And the events emitted should NOT carry mocked: true.
+  const events = sentRequests
+    .filter((r) => r.init?.body)
+    .map((r) => JSON.parse(r.init.body))
+    .filter((e) => e.kind === 'net.request' || e.kind === 'net.response');
+  assert.ok(events.every((e) => e.mocked !== true), 'no events should carry mocked:true');
+});
+
+test('disabled mocks are ignored', async () => {
+  SimConsole.bootstrap({ subsystem: 'test.app' });
+  await new Promise((r) => setImmediate(r));
+  sentRequests.length = 0;
+
+  SimConsole._setMocksForTesting([
+    {
+      id: 'disabled',
+      match: { method: 'GET', url: 'https://api.example.com/users/1' },
+      response: { status: 999, headers: {}, body: 'should not be returned' },
+      delay_ms: 0,
+      enabled: false,
+    },
+  ]);
+
+  const resp = await window.fetch('https://api.example.com/users/1');
+  // Falls through to the stub which always returns 204.
+  assert.equal(resp.status, 204);
+});
+
+test('method match is case-insensitive', async () => {
+  SimConsole.bootstrap({ subsystem: 'test.app' });
+  await new Promise((r) => setImmediate(r));
+  sentRequests.length = 0;
+
+  SimConsole._setMocksForTesting([
+    {
+      id: 'm1',
+      match: { method: 'get', url: 'https://api.example.com/x' },
+      response: { status: 418, headers: {}, body: 'mocked teapot' },
+      delay_ms: 0,
+      enabled: true,
+    },
+  ]);
+
+  const resp = await window.fetch('https://api.example.com/x', { method: 'GET' });
+  assert.equal(resp.status, 418);
 });
 
 test('bootstrap is a no-op when window is undefined (SSR safety)', async () => {

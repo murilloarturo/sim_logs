@@ -26,6 +26,11 @@ export const DEFAULTS = Object.freeze({
   host: '127.0.0.1',
   out: path.join(os.homedir(), '.sim-console', 'web-bridge-events.log'),
   quiet: false,
+  // When set, the bridge serves mocks from
+  //   ~/.sim-console/mocks-<bundleId>.json
+  // — the same file the macOS panel's MockStore writes. Empty means
+  // "no mock support" and /mocks returns [].
+  bundleId: '',
 });
 
 /**
@@ -47,6 +52,55 @@ export function createBridge(opts = {}) {
 
   fs.mkdirSync(path.dirname(cfg.out), { recursive: true });
   if (!opts.append) fs.writeFileSync(cfg.out, '');
+
+  // ---- Mock bridge state ----
+  // Path the macOS panel's MockStore writes when given the same bundleId.
+  // We re-read it whenever fs.watch fires and broadcast the new list to
+  // any connected SSE clients.
+  const mocksPath = cfg.bundleId
+    ? path.join(os.homedir(), '.sim-console', `mocks-${cfg.bundleId}.json`)
+    : '';
+  const sseClients = new Set();
+
+  function readMocks() {
+    if (!mocksPath) return [];
+    try {
+      const raw = fs.readFileSync(mocksPath, 'utf8');
+      const file = JSON.parse(raw);
+      return Array.isArray(file?.mocks) ? file.mocks : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function broadcastMocks() {
+    const payload = JSON.stringify(readMocks());
+    for (const res of sseClients) {
+      try {
+        res.write(`event: mocks\ndata: ${payload}\n\n`);
+      } catch (_) {
+        sseClients.delete(res);
+      }
+    }
+  }
+
+  let mocksWatcher = null;
+  if (mocksPath) {
+    // Ensure the directory exists so fs.watch doesn't throw if the panel
+    // hasn't created any mocks yet.
+    fs.mkdirSync(path.dirname(mocksPath), { recursive: true });
+    // Watch the directory (not the file) because the panel writes
+    // mocks atomically — write to a temp + rename, which file-mode watch
+    // would miss after the first rename.
+    try {
+      mocksWatcher = fs.watch(path.dirname(mocksPath), (_evt, fname) => {
+        if (fname === path.basename(mocksPath)) broadcastMocks();
+      });
+    } catch (_) {
+      // If watch fails (rare — e.g. on macOS over an NFS mount), SDK
+      // polling on /mocks every 3 s is the fallback.
+    }
+  }
 
   function log(...args) {
     if (!cfg.quiet) console.log(...args);
@@ -94,9 +148,29 @@ export function createBridge(opts = {}) {
     }
 
     if (req.method === 'GET' && url.pathname === '/mocks') {
-      // Phase W-C: this will return the panel's MockStore contents.
+      // Reads the panel's MockStore file directly (it owns the data —
+      // we just serve a snapshot). Returns [] when no bundleId was given
+      // or when the panel hasn't written any mocks yet.
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('[]');
+      res.end(JSON.stringify(readMocks()));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/mocks/stream') {
+      // Server-Sent Events stream — every time the panel's mock file
+      // changes, all connected clients receive an `event: mocks` push
+      // with the new list. SDK uses this for sub-second mock updates;
+      // pollers can fall back to /mocks every few seconds.
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+      });
+      // Send the current snapshot immediately so a freshly-connected
+      // SDK doesn't have to wait for the next file change.
+      res.write(`event: mocks\ndata: ${JSON.stringify(readMocks())}\n\n`);
+      sseClients.add(res);
+      req.on('close', () => sseClients.delete(res));
       return;
     }
 
@@ -134,12 +208,20 @@ export function createBridge(opts = {}) {
       server.listen(cfg.port, cfg.host, () => {
         log(`sim-console-bridge listening on http://${cfg.host}:${cfg.port}`);
         log(`writing events to ${cfg.out}`);
+        if (cfg.bundleId) log(`watching mocks at ${mocksPath}`);
         resolve();
       });
     });
   }
 
   function close() {
+    if (mocksWatcher) {
+      try { mocksWatcher.close(); } catch (_) {}
+    }
+    for (const res of sseClients) {
+      try { res.end(); } catch (_) {}
+    }
+    sseClients.clear();
     return new Promise((resolve) => server.close(() => resolve()));
   }
 
@@ -147,8 +229,12 @@ export function createBridge(opts = {}) {
     server,
     start,
     close,
+    broadcastMocks,
     get eventsPath() {
       return cfg.out;
+    },
+    get mocksPath() {
+      return mocksPath;
     },
     get count() {
       return count;

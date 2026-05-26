@@ -13,6 +13,8 @@ async function parseArgs(argv) {
       opts.out = argv[++i];
     } else if (a === '--host') {
       opts.host = argv[++i];
+    } else if (a === '--bundle-id' || a === '-b') {
+      opts.bundleId = argv[++i];
     } else if (a === '--append') {
       opts.append = true;
     } else if (a === '--quiet' || a === '-q') {
@@ -44,6 +46,10 @@ Options:
       --host  <ip>   Bind address (default ${DEFAULTS.host}; use 0.0.0.0 to
                      accept connections from other machines on the LAN)
   -o, --out   <path> NDJSON output file (default ~/.sim-console/web-bridge-events.log)
+  -b, --bundle-id <id>  App subsystem id. When set, GET /mocks reads from
+                        ~/.sim-console/mocks-<id>.json (the file the macOS
+                        panel's MockStore writes) and the bridge pushes
+                        updates over /mocks/stream when the file changes.
       --append       Don't truncate the output file on startup
   -q, --quiet        Suppress startup logs
   -v, --version      Print version and exit

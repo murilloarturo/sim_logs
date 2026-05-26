@@ -726,8 +726,11 @@ except Exception:
 
 ```bash
 # Log the bridge's startup to a temp file so we can show it if it crashes.
+# Pass --bundle-id so the bridge can serve the panel's mock file at /mocks
+# (Phase W-C). Without it the SDK gets [] back and per-request mocking
+# doesn't work, but events still flow normally.
 BRIDGE_LOG="/tmp/simconsole-bridge-$$.log"
-node "$SIM_CONSOLE_BRIDGE" --quiet --port "$BRIDGE_PORT" > "$BRIDGE_LOG" 2>&1 &
+node "$SIM_CONSOLE_BRIDGE" --quiet --port "$BRIDGE_PORT" --bundle-id "$SUBSYSTEM" > "$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 sleep 0.4
 if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then

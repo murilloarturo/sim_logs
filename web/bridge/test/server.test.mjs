@@ -99,12 +99,82 @@ test('GET /health reports running state with count + path', async () => {
   });
 });
 
-test('GET /mocks returns an empty array (Phase W-C placeholder)', async () => {
+test('GET /mocks returns an empty array when no bundleId is configured', async () => {
   await withBridge({ out: tmpOut('mocks') }, async (_b, port) => {
     const r = await fetch(`http://127.0.0.1:${port}/mocks`);
     assert.equal(r.status, 200);
     assert.deepEqual(await r.json(), []);
   });
+});
+
+test('GET /mocks reads from ~/.sim-console/mocks-<bundleId>.json when bundleId is set', async () => {
+  // Use a unique bundleId per test so two parallel runs don't collide on
+  // the same file.
+  const bundleId = `web-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const mocksPath = path.join(os.homedir(), '.sim-console', `mocks-${bundleId}.json`);
+  fs.mkdirSync(path.dirname(mocksPath), { recursive: true });
+  fs.writeFileSync(
+    mocksPath,
+    JSON.stringify({
+      version: 1,
+      mocks: [
+        {
+          id: 'mock-1',
+          match: { method: 'GET', url: 'https://api.example.com/users/1' },
+          response: { status: 200, headers: {}, body: '{"id":1}' },
+          delay_ms: 0,
+          enabled: true,
+          created_at: '2026-05-26T10:00:00Z',
+        },
+      ],
+    })
+  );
+  try {
+    await withBridge({ out: tmpOut('mocks-file'), bundleId }, async (_b, port) => {
+      const r = await fetch(`http://127.0.0.1:${port}/mocks`);
+      const mocks = await r.json();
+      assert.equal(r.status, 200);
+      assert.equal(mocks.length, 1);
+      assert.equal(mocks[0].id, 'mock-1');
+      assert.equal(mocks[0].match.method, 'GET');
+    });
+  } finally {
+    try { fs.unlinkSync(mocksPath); } catch (_) {}
+  }
+});
+
+test('GET /mocks/stream sends the current snapshot immediately on connect', async () => {
+  const bundleId = `web-test-sse-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const mocksPath = path.join(os.homedir(), '.sim-console', `mocks-${bundleId}.json`);
+  fs.mkdirSync(path.dirname(mocksPath), { recursive: true });
+  fs.writeFileSync(
+    mocksPath,
+    JSON.stringify({
+      version: 1,
+      mocks: [
+        { id: 'm-sse-1', match: { method: 'GET', url: 'https://a.test/' },
+          response: { status: 200, headers: {}, body: '' },
+          delay_ms: 0, enabled: true, created_at: '2026-05-26T10:00:00Z' },
+      ],
+    })
+  );
+  try {
+    await withBridge({ out: tmpOut('sse'), bundleId }, async (_b, port) => {
+      // Read the first SSE event off the stream. We don't use EventSource
+      // (which doesn't expose a clean cancel API in Node) — we just parse
+      // the wire format ourselves.
+      const ac = new AbortController();
+      const r = await fetch(`http://127.0.0.1:${port}/mocks/stream`, { signal: ac.signal });
+      const reader = r.body.getReader();
+      const { value } = await reader.read();
+      const chunk = new TextDecoder().decode(value);
+      ac.abort();
+      assert.match(chunk, /^event: mocks\n/);
+      assert.match(chunk, /"m-sse-1"/);
+    });
+  } finally {
+    try { fs.unlinkSync(mocksPath); } catch (_) {}
+  }
 });
 
 test('OPTIONS preflight returns 204 with permissive CORS headers', async () => {

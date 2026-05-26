@@ -30,6 +30,14 @@ const state = {
   queued: [],
   lastScreen: undefined,
   netIdCounter: 0,
+  // Mocks fetched from the bridge. Stored as an array so we can preserve
+  // the panel's intended order — first-match wins, same as the iOS
+  // SimConsoleURLProtocol does for its own mocks. The SDK is told about
+  // updates two ways: an initial GET /mocks at bootstrap, then live pushes
+  // over Server-Sent Events at /mocks/stream.
+  mocks: [],
+  mocksEventSource: null,
+  mocksPollTimer: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +82,75 @@ function nextNetId() {
 }
 
 // ---------------------------------------------------------------------------
+// Mock cache + sync
+
+function applyMockList(list) {
+  state.mocks = Array.isArray(list) ? list.filter((m) => m && m.enabled !== false) : [];
+}
+
+async function loadMocksOnce() {
+  try {
+    const r = await fetch(`${state.bridge}/mocks`);
+    if (!r.ok) return;
+    applyMockList(await r.json());
+  } catch (_) {
+    // Bridge unreachable — leave mocks empty.
+  }
+}
+
+function startMockStream() {
+  // Prefer SSE (sub-second updates, no polling cost). If the browser
+  // doesn't have EventSource (very old environments) or the bridge
+  // declines the connection, fall back to a 3 s poll loop.
+  if (typeof EventSource === 'undefined') {
+    state.mocksPollTimer = setInterval(loadMocksOnce, 3000);
+    return;
+  }
+  try {
+    const es = new EventSource(`${state.bridge}/mocks/stream`);
+    state.mocksEventSource = es;
+    es.addEventListener('mocks', (ev) => {
+      try { applyMockList(JSON.parse(ev.data)); } catch (_) {}
+    });
+    es.onerror = () => {
+      // EventSource will keep reconnecting on its own with exponential
+      // backoff. We don't need to do anything except keep the latest
+      // snapshot until the next push arrives.
+    };
+  } catch (_) {
+    state.mocksPollTimer = setInterval(loadMocksOnce, 3000);
+  }
+}
+
+/**
+ * Find the first enabled mock that matches `method` + `url`. Match rules
+ * mirror the macOS panel's `MockStore.mock(matchingMethod:url:)`:
+ *   - method comparison is case-insensitive
+ *   - url comparison is *exact string equality*
+ * The future bodyContains constraint isn't honored here yet; if the panel
+ * sets it, the request just won't match and falls through to the network.
+ */
+function findMatchingMock(method, url) {
+  const m = (method || 'GET').toUpperCase();
+  for (const mock of state.mocks) {
+    if (!mock || !mock.match) continue;
+    if ((mock.match.method || '').toUpperCase() !== m) continue;
+    if (mock.match.url !== url) continue;
+    return mock;
+  }
+  return undefined;
+}
+
+/** Build a fetch-style Response from a Mock's response object. */
+function synthesizeResponse(mock) {
+  const headers = new Headers(mock.response?.headers || {});
+  return new Response(mock.response?.body ?? '', {
+    status: mock.response?.status ?? 200,
+    headers,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Network instrumentation
 
 function installFetchWrapper(root) {
@@ -90,16 +167,42 @@ function installFetchWrapper(root) {
       'GET';
     const id = nextNetId();
     const start = performance.now();
+    const requestHeaders = headersToObject(
+      init.headers || (typeof input !== 'string' && input && input.headers)
+    );
+    const requestBody = typeof init.body === 'string' ? init.body : undefined;
+
+    // Mock check: if the panel's MockStore has an enabled entry for this
+    // (method, url), short-circuit with the mocked Response instead of
+    // hitting the network. Emit `net.request` + `net.response` with
+    // `mocked: true` so the panel renders the "MOCKED" badge — exact
+    // mirror of how iOS's SimConsoleURLProtocol behaves.
+    const mock = findMatchingMock(method, url);
+    if (mock) {
+      send({
+        kind: 'net.request', id, method, url,
+        request_headers: requestHeaders, request_body: requestBody,
+        mocked: true,
+      });
+      if (mock.delay_ms > 0) await new Promise((r) => setTimeout(r, mock.delay_ms));
+      const resp = synthesizeResponse(mock);
+      const clone = resp.clone();
+      let body;
+      try { body = await clone.text(); } catch (_) { body = undefined; }
+      send({
+        kind: 'net.response', id,
+        status: resp.status,
+        duration_ms: Math.round(performance.now() - start),
+        response_headers: headersToObject(resp.headers),
+        response_body: clipBody(body),
+        mocked: true,
+      });
+      return resp;
+    }
 
     send({
-      kind: 'net.request',
-      id,
-      method,
-      url,
-      request_headers: headersToObject(
-        init.headers || (typeof input !== 'string' && input && input.headers)
-      ),
-      request_body: typeof init.body === 'string' ? init.body : undefined,
+      kind: 'net.request', id, method, url,
+      request_headers: requestHeaders, request_body: requestBody,
     });
 
     try {
@@ -252,6 +355,10 @@ const SimConsole = {
     flushQueue();
     installFetchWrapper(window);
     installXhrWrapper(window);
+    // Subscribe to the panel's MockStore via the bridge so fetch() can
+    // short-circuit matching requests. Initial GET seeds the cache before
+    // the SSE channel is established; the EventSource then keeps it live.
+    loadMocksOnce().then(startMockStream);
   },
 
   /** Closes the launch-timing arc. Call once after first paint. */
@@ -314,6 +421,20 @@ const SimConsole = {
     state.queued.length = 0;
     state.lastScreen = undefined;
     state.netIdCounter = 0;
+    state.mocks = [];
+    if (state.mocksEventSource) {
+      try { state.mocksEventSource.close(); } catch (_) {}
+      state.mocksEventSource = null;
+    }
+    if (state.mocksPollTimer) {
+      clearInterval(state.mocksPollTimer);
+      state.mocksPollTimer = null;
+    }
+  },
+
+  /** @internal — let tests inject a mock list without spinning up a bridge. */
+  _setMocksForTesting(list) {
+    applyMockList(list);
   },
 };
 

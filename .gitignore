@@ -48,3 +48,8 @@ fastlane/test_output
 
 # Local logs / diagnostics
 /tmp/sim-console.log
+
+# web/ packages — pure-JS, no committed lockfile / install
+web/**/node_modules/
+web/**/dist/build/
+web/**/*.tgz

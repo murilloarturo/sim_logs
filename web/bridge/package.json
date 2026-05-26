@@ -1,0 +1,37 @@
+{
+  "name": "@simconsole/bridge",
+  "version": "0.1.0",
+  "description": "Local HTTP bridge between the @simconsole/web SDK and the SimConsole macOS panel.",
+  "type": "module",
+  "main": "./src/server.mjs",
+  "exports": {
+    ".": "./src/server.mjs"
+  },
+  "bin": {
+    "simconsole-bridge": "./bin/simconsole-bridge.mjs"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "simconsole",
+    "dev-tools",
+    "logging",
+    "web"
+  ],
+  "author": "Arturo Murillo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/murilloarturo/sim_logs.git",
+    "directory": "web/bridge"
+  }
+}

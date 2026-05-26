@@ -33,7 +33,7 @@ import Combine
 // ---------------------------------------------------------------------------
 // MARK: - CLI args
 
-enum Platform: String { case ios, android }
+enum Platform: String { case ios, android, web }
 
 struct TabSpec {
     enum Kind: String { case network, analytics, text, metric }
@@ -76,6 +76,11 @@ struct Args {
     /// than a borderless overlay that tracks the sim/emulator. Required for
     /// USB-connected physical devices (no on-screen device window to dock to).
     var detached: Bool = false
+    /// Path to the NDJSON file the web bridge appends events to. Each tab
+    /// spawns `tail -n 0 -F <path>` so events stream in line-by-line — same
+    /// shape as `simctl spawn log stream` output. Defaults to
+    /// `~/.sim-console/web-bridge-events.log` when --platform web is passed.
+    var webSource: String = ""
 }
 
 func parseColor(_ hex: String) -> Color? {
@@ -125,6 +130,7 @@ func parseArgs() -> Args {
         case "--adb-path":  a.adbPath = argv[i+1]; i += 2
         case "--idevicesyslog-path": a.ideviceSyslogPath = argv[i+1]; i += 2
         case "--ios-process-name": a.iosProcessName = argv[i+1]; i += 2
+        case "--web-source": a.webSource = argv[i+1]; i += 2
         case "--detached":  a.detached = true; i += 1
         default: i += 1
         }
@@ -134,6 +140,16 @@ func parseArgs() -> Args {
     }
     if a.platform == .ios && a.detached && a.ideviceSyslogPath.isEmpty {
         a.ideviceSyslogPath = resolveIdeviceSyslogPath()
+    }
+    if a.platform == .web {
+        // Web is always "detached" — there's no on-screen device window to
+        // dock against, and the panel is the only visible surface. Default
+        // the source file path if the caller didn't pass one.
+        a.detached = true
+        if a.webSource.isEmpty {
+            a.webSource = (NSHomeDirectory() as NSString)
+                .appendingPathComponent(".sim-console/web-bridge-events.log")
+        }
     }
     return a
 }
@@ -756,7 +772,23 @@ final class TabViewModel: ObservableObject, Identifiable {
             }
         case .android:
             startAndroid(serial: args.device, adbPath: args.adbPath)
+        case .web:
+            startWeb(source: args.webSource)
         }
+    }
+
+    /// Spawn `tail -n 0 -F <file>` so each tab streams the NDJSON events the
+    /// web bridge appends. `-F` (capital) survives log rotation; `-n 0` skips
+    /// the historical backlog so we only see lines emitted after the panel
+    /// attaches (mirrors `adb logcat -T 1` and `simctl spawn log stream`).
+    /// The per-tab `kind`-dispatch in `ingest` filters lines to the right
+    /// typed view — no extra predicate filter needed since the bridge only
+    /// writes SDK events.
+    private func startWeb(source: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
+        proc.arguments = ["-n", "0", "-F", source]
+        runStreamingProcess(proc, label: "web")
     }
 
     /// Pull the `category == "X"` constraint out of an NSPredicate string.
@@ -2974,6 +3006,12 @@ final class Controller {
         case .android:
             hostRunning = emulatorAppRunning()
             axRect = hostRunning ? findEmulatorWindowFrame(matching: args.tag) : nil
+        case .web:
+            // Web is always detached (set in parseArgs), so this branch of
+            // tick() is unreachable. Defensive defaults keep the compiler
+            // happy without forcing a `fatalError` we'd hate to hit.
+            hostRunning = true
+            axRect = nil
         }
         if !hostRunning {
             diag("host (\(args.platform.rawValue)) no longer running; exiting")
@@ -3057,6 +3095,12 @@ final class Controller {
             attached = iosDeviceAttached(udid: args.device)
         case .android:
             attached = androidDeviceAttached(serial: args.device, adbPath: args.adbPath)
+        case .web:
+            // Web is bridge-driven — there's nothing physical to detach.
+            // The panel stays up until the user closes it, or the user
+            // shuts down the bridge process (in which case the tail
+            // subprocess will just wait quietly for the file to come back).
+            attached = true
         }
         if !attached {
             diag("detached target (\(args.platform.rawValue) \(args.device)) disconnected; exiting")
@@ -3084,6 +3128,10 @@ final class Controller {
         case .android:
             guard emulatorAppRunning() else { return nil }
             axRect = findEmulatorWindowFrame(matching: args.tag)
+        case .web:
+            // No on-screen device window for web; caller falls back to the
+            // saved frame / default rect.
+            return nil
         }
         guard let axRect else { return nil }
         let cocoaRect = axToCocoa(axRect)
@@ -3226,7 +3274,7 @@ final class Controller {
 // MARK: - Main
 
 let args = parseArgs()
-guard !args.device.isEmpty else {
+guard !args.device.isEmpty || args.platform == .web else {
     FileHandle.standardError.write(Data("sim-console: --device required\n".utf8))
     exit(2)
 }

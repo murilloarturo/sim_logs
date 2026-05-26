@@ -1,0 +1,43 @@
+{
+  "name": "@simconsole/web",
+  "version": "0.1.0",
+  "description": "Browser SDK that pipes analytics, logs, metrics, and network requests into the SimConsole macOS panel.",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src/",
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "simconsole",
+    "dev-tools",
+    "logging",
+    "analytics",
+    "web",
+    "browser",
+    "sdk"
+  ],
+  "author": "Arturo Murillo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/murilloarturo/sim_logs.git",
+    "directory": "web/sdk"
+  }
+}

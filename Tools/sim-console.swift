@@ -1323,6 +1323,9 @@ private enum Theme {
     static let bg = Color(red: 0.08, green: 0.08, blue: 0.08)
     static let rowBg = Color(red: 0.10, green: 0.10, blue: 0.10)
     static let rowAlt = Color(red: 0.12, green: 0.12, blue: 0.12)
+    /// One step lighter than `bg` so the header reads as elevated chrome
+    /// without dominating the view the way a bright accent band did.
+    static let headerBg = Color(red: 0.13, green: 0.13, blue: 0.13)
     static let stroke = Color.white.opacity(0.06)
     static let textPrimary = Color.white.opacity(0.93)
     static let textSecondary = Color.white.opacity(0.62)
@@ -1337,7 +1340,11 @@ struct RootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(state: state)
+            // No standalone header bar — the title bar already shows
+            // "SimConsole — <subsystem>", so a second label below it was
+            // pure redundancy with a loud accent band. The Attach/Detach
+            // toggle moved into SegmentBar (right-aligned, separated from
+            // the tabs).
             SegmentBar(state: state)
             SearchBar(state: state)
             Divider().background(Theme.stroke)
@@ -1402,16 +1409,31 @@ struct HeaderBar: View {
     @ObservedObject var state: ConsoleState
     var body: some View {
         HStack(spacing: 8) {
+            // Small accent pill on the left — keeps the user's --accent
+            // color as visual identity without flooding the whole bar with
+            // bright blue. The label text reads against the dark panel chrome
+            // instead, which integrates with the rest of the UI.
+            Circle()
+                .fill(state.accent)
+                .frame(width: 7, height: 7)
+                .padding(.leading, 12)
             Text(state.appLabel)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.black)
-                .padding(.leading, 10)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
             Spacer()
             AttachToggle(state: state)
                 .padding(.trailing, 8)
         }
-        .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
-        .background(state.accent)
+        .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
+        .background(Theme.headerBg)
+        .overlay(
+            // Hairline separator below the header — gives the bar a clean
+            // edge against the tab strip without needing a heavier border.
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1),
+            alignment: .bottom
+        )
     }
 }
 
@@ -1452,21 +1474,33 @@ struct AttachToggle: View {
 struct SegmentBar: View {
     @ObservedObject var state: ConsoleState
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(Array(state.tabs.enumerated()), id: \.element.id) { idx, tab in
-                SegmentChip(
-                    label: tab.spec.name,
-                    badge: tab === state.activeTab ? 0 : tab.unread,
-                    active: idx == state.activeIndex,
-                    // Metric tabs are *always* live recording from the moment
-                    // the panel attaches — surface that with a pulsing red dot
-                    // instead of an ever-growing event counter that the user
-                    // can't act on.
-                    isLiveStream: tab.spec.kind == .metric
-                )
-                .onTapGesture { state.select(idx) }
+        HStack(spacing: 8) {
+            // Tabs go in a horizontal ScrollView so they don't get truncated
+            // or wrap when the window is narrow. The scroll indicator hides
+            // by default but a horizontal trackpad swipe reveals the rest.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(Array(state.tabs.enumerated()), id: \.element.id) { idx, tab in
+                        SegmentChip(
+                            label: tab.spec.name,
+                            badge: tab === state.activeTab ? 0 : tab.unread,
+                            active: idx == state.activeIndex,
+                            // Metric tabs are *always* live recording from the
+                            // moment the panel attaches — surface that with a
+                            // pulsing red dot instead of an ever-growing event
+                            // counter the user can't act on.
+                            isLiveStream: tab.spec.kind == .metric
+                        )
+                        .onTapGesture { state.select(idx) }
+                    }
+                }
+                .padding(.trailing, 4)
             }
-            Spacer(minLength: 0)
+            // Attach/Detach toggle pinned on the right, separated from the
+            // tab strip by the 8pt HStack spacing. Hidden entirely on
+            // platforms where there's no on-screen device window to dock to
+            // (USB iPhone, Android — see AttachToggle's `attachAvailable`).
+            AttachToggle(state: state)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
@@ -1483,7 +1517,7 @@ struct SegmentChip: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
-                .font(.system(size: 11, weight: active ? .semibold : .regular))
+                .font(.system(size: 13, weight: active ? .semibold : .regular))
                 .foregroundColor(active ? Theme.textPrimary : Theme.textSecondary)
             if isLiveStream {
                 // Always show the pulsing recording dot for live-stream tabs
@@ -2879,7 +2913,15 @@ final class Controller {
             backing: .buffered,
             defer: false
         )
-        panel.title = args.appLabel.isEmpty ? "SimConsole" : "SimConsole — \(args.appLabel)"
+        // Surface "which app is this panel attached to?" in the title bar
+        // so we can drop the secondary header label entirely. Precedence:
+        //   1. --app-label if the caller passed one
+        //   2. --bundle-id (the subsystem) — what most users actually care about
+        //   3. plain "SimConsole" fallback
+        let titleSuffix = args.appLabel.isEmpty
+            ? (args.bundleId.isEmpty ? "" : args.bundleId)
+            : args.appLabel
+        panel.title = titleSuffix.isEmpty ? "SimConsole" : "SimConsole — \(titleSuffix)"
         panel.isOpaque = true
         panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         panel.hasShadow = true

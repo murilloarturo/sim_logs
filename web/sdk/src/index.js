@@ -261,8 +261,10 @@ const SimConsole = {
   },
 
   analytics(event, params = {}) {
+    // `kind` mirrors what the iOS/Android SDKs emit so the panel's
+    // ingestAnalytics decoder parses these into typed AnalyticsEntry rows.
     send({
-      kind: 'analytics.event',
+      kind: 'analytics',
       event,
       params,
       screen: state.lastScreen,
@@ -271,11 +273,15 @@ const SimConsole = {
 
   screen(name, params = {}) {
     state.lastScreen = name;
-    send({ kind: 'analytics.screen', name, params });
+    // Same convention as iOS/Android: kind=screen, screen field carries
+    // the name. The panel's analytics decoder special-cases this.
+    send({ kind: 'screen', screen: name, params });
   },
 
   log(message, level = 'info', fields = {}) {
-    send({ kind: 'log.event', message, level, fields });
+    // `kind` matches the iOS/Android SDKs — the MCP server filters on this
+    // string so cross-platform queries (`kind == "log"`) Just Work.
+    send({ kind: 'log', message, level, fields });
   },
 
   metric: {

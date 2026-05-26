@@ -48,10 +48,10 @@ test('analytics() before bootstrap queues, flushes on bootstrap', async () => {
 
   const events = sentRequests.map((r) => JSON.parse(r.init.body));
   // Bootstrap also emits session.register and metric.launch.start, plus
-  // the queued analytics.event flushes — 3 events expected.
+  // the queued analytics event flushes — 3 events expected.
   assert.equal(events.length, 3);
   const kinds = events.map((e) => e.kind).sort();
-  assert.deepEqual(kinds, ['analytics.event', 'metric.launch.start', 'session.register']);
+  assert.deepEqual(kinds, ['analytics', 'metric.launch.start', 'session.register']);
 });
 
 test('bootstrap emits a session.register with origin/title/user_agent', async () => {
@@ -151,9 +151,9 @@ test('screen() updates context so the next analytics() carries screen name', asy
 
   const screenEvt = JSON.parse(sentRequests[0].init.body);
   const analyticsEvt = JSON.parse(sentRequests[1].init.body);
-  assert.equal(screenEvt.kind, 'analytics.screen');
-  assert.equal(screenEvt.name, 'Settings');
-  assert.equal(analyticsEvt.kind, 'analytics.event');
+  assert.equal(screenEvt.kind, 'screen');
+  assert.equal(screenEvt.screen, 'Settings');
+  assert.equal(analyticsEvt.kind, 'analytics');
   assert.equal(analyticsEvt.screen, 'Settings');
 });
 
@@ -166,7 +166,7 @@ test('log() includes message + level + fields in the event payload', async () =>
   await new Promise((r) => setImmediate(r));
 
   const evt = JSON.parse(sentRequests[0].init.body);
-  assert.equal(evt.kind, 'log.event');
+  assert.equal(evt.kind, 'log');
   assert.equal(evt.message, 'something went wrong');
   assert.equal(evt.level, 'error');
   assert.deepEqual(evt.fields, { code: 'E_NET' });

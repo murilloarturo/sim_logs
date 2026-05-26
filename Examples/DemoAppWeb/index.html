@@ -39,55 +39,55 @@
   <h1>SimConsole — web demo</h1>
   <div class="sub">
     Open the panel beside this page (<code>--platform web</code>) and click
-    any button. Every action surfaces in a structured tab.
+    any button. Every action surfaces in a structured tab — the page itself
+    stays put.
   </div>
 
   <div class="grid">
     <section>
       <h2>Metrics</h2>
-      <button onclick="SimConsole.metric.gauge('cache.hit_rate', Math.random())">gauge cache.hit_rate (random)</button>
-      <button onclick="SimConsole.metric.counter('retries')">counter retries++</button>
-      <button onclick="SimConsole.metric.signpost('feed_decode', 80 + Math.floor(Math.random()*60))">signpost feed_decode ~80–140ms</button>
-      <button onclick="hangMainThread()">Block main thread 600ms (hang)</button>
+      <button type="button" id="m-gauge">gauge cache.hit_rate (random)</button>
+      <button type="button" id="m-counter">counter retries++</button>
+      <button type="button" id="m-signpost">signpost feed_decode ~80–140ms</button>
+      <button type="button" id="m-hang">Block main thread 600ms (hang)</button>
     </section>
 
     <section>
       <h2>Network (auto-instrumented)</h2>
-      <button onclick="fetch('https://jsonplaceholder.typicode.com/posts/1').then(r => r.json()).then(j => write('GET /posts/1 → ' + JSON.stringify(j).slice(0,80)))">GET /posts/1</button>
-      <button onclick="postJson()">POST /posts (JSON body)</button>
-      <button onclick="fetch('https://httpbin.org/status/404').then(r => write('GET /status/404 → ' + r.status))">GET /status/404 (error status)</button>
-      <button onclick="fetch('https://httpbin.org/delay/3').then(r => write('GET /delay/3 → done'))">GET /delay/3 (slow)</button>
+      <button type="button" id="n-get-post">GET /posts/1</button>
+      <button type="button" id="n-post">POST /posts (JSON body)</button>
+      <button type="button" id="n-404">GET /status/404 (error status)</button>
+      <button type="button" id="n-slow">GET /delay/3 (slow)</button>
     </section>
 
     <section>
       <h2>Analytics</h2>
-      <button onclick="SimConsole.analytics('button_tapped', {button:'one', n: ++ctr})">Fire analytics event</button>
-      <button onclick="SimConsole.analytics('purchase', {sku:'premium_monthly', price:9.99, currency:'USD'})">purchase (typed-like)</button>
-      <button onclick="SimConsole.screen('Settings', {source:'demo'})">screen: Settings</button>
-      <button onclick="SimConsole.screen('Profile', {source:'demo', user_id:'demo-123'})">screen: Profile</button>
+      <button type="button" id="a-tap">Fire analytics event</button>
+      <button type="button" id="a-purchase">purchase (typed-like)</button>
+      <button type="button" id="a-screen-settings">screen: Settings</button>
+      <button type="button" id="a-screen-profile">screen: Profile</button>
     </section>
 
     <section>
       <h2>Logs</h2>
-      <button onclick="SimConsole.log('info line #' + (++ctr), 'info', {ctr})">log .info</button>
-      <button onclick="SimConsole.log('warn line', 'warn', {ctr})">log .warn</button>
-      <button onclick="SimConsole.log('Decode failed', 'error', {endpoint:'/api/v1/profile', received_keys:['id','username']})">log .error (rich)</button>
-      <button onclick="SimConsole.log('Cart updated', 'info', {items:[{sku:'A1',qty:2},{sku:'B7',qty:1}], total:44.48})">log nested object</button>
+      <button type="button" id="l-info">log .info</button>
+      <button type="button" id="l-warn">log .warn</button>
+      <button type="button" id="l-error">log .error (rich)</button>
+      <button type="button" id="l-nested">log nested object</button>
     </section>
   </div>
 
   <section style="margin-top: 24px;">
     <h2>Auto activity</h2>
     <div class="row">
-      <button id="auto" onclick="toggleAuto(this)">Start auto-fire (mixed)</button>
-      <button onclick="bridgeHealth()">Probe bridge /health</button>
+      <button type="button" id="auto">Start auto-fire (mixed)</button>
+      <button type="button" id="health">Probe bridge /health</button>
     </div>
   </section>
 
   <div id="log"></div>
 
-  <!-- Drop the SDK in as a plain ESM module. In a real project this would
-       be `import SimConsole from '@simconsole/web'` after npm install. -->
+  <!-- SDK loaded as ESM. window.SimConsole is set by the SDK on bootstrap. -->
   <script type="module">
     import SimConsole from '../../web/sdk/src/index.js';
     window.SimConsole = SimConsole;
@@ -100,39 +100,97 @@
     SimConsole.log('demo page loaded', 'info', { url: location.href });
   </script>
 
+  <!-- Wire up button handlers AFTER the SDK script has set window.SimConsole.
+       Using addEventListener (not inline onclick) avoids the silent-fail
+       footgun where a bad inline expression lets the button's default
+       action (submit) fire and navigate the page. Every handler explicitly
+       calls preventDefault as a belt-and-braces guard. -->
   <script>
-    let ctr = 0;
-    let autoTask = null;
-
+    const log = document.getElementById('log');
     function write(msg) {
-      const el = document.getElementById('log');
       const ts = new Date().toISOString().slice(11, 19);
-      el.textContent = `[${ts}] ${msg}\n` + el.textContent;
+      log.textContent = `[${ts}] ${msg}\n` + log.textContent;
     }
 
-    function postJson() {
-      fetch('https://jsonplaceholder.typicode.com/posts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'SimConsole', body: 'hello from the demo', userId: 1 }),
-      }).then(r => r.json()).then(j => write('POST /posts → id=' + j.id));
+    // Guard: any rogue submit somewhere on the page should not navigate.
+    // No <form> elements exist in this demo, but if a future edit adds
+    // one we still don't want the page to refresh.
+    document.addEventListener('submit', (e) => e.preventDefault());
+
+    // Helper that wires a button to a handler with consistent guards.
+    function on(id, fn) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        try { fn(); } catch (e) { write('handler error: ' + e.message); }
+      });
     }
 
-    function hangMainThread() {
+    // ----- Metrics -----
+    let ctr = 0;
+    on('m-gauge',   () => { SimConsole.metric.gauge('cache.hit_rate', Math.random()); write('gauge fired'); });
+    on('m-counter', () => { SimConsole.metric.counter('retries'); write('counter fired'); });
+    on('m-signpost',() => { const ms = 80 + Math.floor(Math.random()*60);
+                            SimConsole.metric.signpost('feed_decode', ms);
+                            write('signpost feed_decode=' + ms + 'ms'); });
+    on('m-hang',    () => {
+      write('blocking 600ms…');
       const t0 = performance.now();
       while (performance.now() - t0 < 600) { /* burn */ }
-      write('hung main thread for 600ms');
-    }
+      write('main thread released');
+    });
 
-    async function bridgeHealth() {
+    // ----- Network -----
+    on('n-get-post', async () => {
       try {
-        const r = await fetch('http://localhost:9229/health');
-        write('bridge /health → ' + (await r.text()).slice(0, 120));
-      } catch (e) {
-        write('bridge unreachable: ' + e.message);
-      }
-    }
+        const r = await fetch('https://jsonplaceholder.typicode.com/posts/1');
+        const j = await r.json();
+        write('GET /posts/1 → ' + JSON.stringify(j).slice(0, 80));
+      } catch (e) { write('fetch error: ' + e.message); }
+    });
+    on('n-post', async () => {
+      try {
+        const r = await fetch('https://jsonplaceholder.typicode.com/posts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: 'SimConsole', body: 'hello', userId: 1 }),
+        });
+        const j = await r.json();
+        write('POST /posts → id=' + j.id);
+      } catch (e) { write('fetch error: ' + e.message); }
+    });
+    on('n-404', async () => {
+      try {
+        const r = await fetch('https://httpbin.org/status/404');
+        write('GET /status/404 → ' + r.status);
+      } catch (e) { write('fetch error: ' + e.message); }
+    });
+    on('n-slow', async () => {
+      write('GET /delay/3 …');
+      try {
+        const r = await fetch('https://httpbin.org/delay/3');
+        write('GET /delay/3 → done (' + r.status + ')');
+      } catch (e) { write('fetch error: ' + e.message); }
+    });
 
+    // ----- Analytics -----
+    on('a-tap',             () => { SimConsole.analytics('button_tapped', { button: 'one', n: ++ctr }); write('analytics: button_tapped #' + ctr); });
+    on('a-purchase',        () => { SimConsole.analytics('purchase', { sku: 'premium_monthly', price: 9.99, currency: 'USD' }); write('analytics: purchase'); });
+    on('a-screen-settings', () => { SimConsole.screen('Settings', { source: 'demo' }); write('screen: Settings'); });
+    on('a-screen-profile',  () => { SimConsole.screen('Profile',  { source: 'demo', user_id: 'demo-123' }); write('screen: Profile'); });
+
+    // ----- Logs -----
+    on('l-info',   () => { SimConsole.log('info line #' + (++ctr), 'info', { ctr }); write('log .info #' + ctr); });
+    on('l-warn',   () => { SimConsole.log('warn line', 'warn', { ctr }); write('log .warn'); });
+    on('l-error',  () => { SimConsole.log('Decode failed', 'error',
+                            { endpoint: '/api/v1/profile', received_keys: ['id','username'] });
+                            write('log .error'); });
+    on('l-nested', () => { SimConsole.log('Cart updated', 'info',
+                            { items: [{sku:'A1', qty:2}, {sku:'B7', qty:1}], total: 44.48 });
+                            write('log nested object'); });
+
+    // ----- Auto activity -----
     const ENDPOINTS = [
       ['GET', 'https://jsonplaceholder.typicode.com/posts/1'],
       ['GET', 'https://jsonplaceholder.typicode.com/users/2'],
@@ -140,8 +198,9 @@
       ['GET', 'https://httpbin.org/status/404'],
     ];
     const EVENT_NAMES = ['page_view', 'button_tapped', 'scroll', 'swipe', 'long_press'];
-
-    function toggleAuto(btn) {
+    let autoTask = null;
+    on('auto', () => {
+      const btn = document.getElementById('auto');
       if (autoTask) {
         clearInterval(autoTask);
         autoTask = null;
@@ -160,7 +219,16 @@
         const ep = ENDPOINTS[n % ENDPOINTS.length];
         fetch(ep[1], { method: ep[0] }).catch(() => {});
       }, 1500);
-    }
+    });
+
+    on('health', async () => {
+      try {
+        const r = await fetch('http://localhost:9229/health');
+        write('bridge /health → ' + (await r.text()).slice(0, 120));
+      } catch (e) {
+        write('bridge unreachable: ' + e.message);
+      }
+    });
   </script>
 </body>
 </html>
